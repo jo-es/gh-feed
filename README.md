@@ -19,6 +19,18 @@ npm install
 npm link
 ```
 
+## Install as `gh` extension
+
+```bash
+gh extension install jo-es/gh-reader
+```
+
+Run it as:
+
+```bash
+gh reader
+```
+
 ## Run
 
 ```bash
