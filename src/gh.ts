@@ -273,61 +273,6 @@ function normalizeReviewComments(input: ReviewComment[]): ReviewComment[] {
   });
 }
 
-function normalizeReviews(input: PullRequestReview[]): PullRequestReview[] {
-  return [...input].sort((a, b) => {
-    const aTime = a.submitted_at ? new Date(a.submitted_at).getTime() : 0;
-    const bTime = b.submitted_at ? new Date(b.submitted_at).getTime() : 0;
-    return bTime - aTime;
-  });
-}
-
-function mergeTimelineReviewedEvents(
-  existing: PullRequestReview[],
-  timelineEvents: unknown[]
-): PullRequestReview[] {
-  const byId = new Map<number, PullRequestReview>();
-  for (const review of existing) {
-    byId.set(review.id, review);
-  }
-
-  for (const event of timelineEvents) {
-    if (!event || typeof event !== "object") {
-      continue;
-    }
-
-    const typed = event as {
-      event?: string;
-      id?: number;
-      body?: string;
-      html_url?: string;
-      state?: string;
-      submitted_at?: string;
-      created_at?: string;
-      user?: { login?: string };
-    };
-
-    if (typed.event !== "reviewed") {
-      continue;
-    }
-
-    const id = typeof typed.id === "number" ? typed.id : 0;
-    if (!id || byId.has(id)) {
-      continue;
-    }
-
-    byId.set(id, {
-      id,
-      body: typed.body || "",
-      html_url: typed.html_url || "",
-      state: (typed.state || "COMMENTED").toUpperCase(),
-      submitted_at: typed.submitted_at || typed.created_at || null,
-      user: typed.user?.login ? { login: typed.user.login } : null
-    });
-  }
-
-  return normalizeReviews([...byId.values()]);
-}
-
 export async function loadPrComments(options: CliOptions): Promise<LoadedPrComments> {
   const repo = await resolveRepo(options.repoOverride);
   const { pr, inference } = await resolvePr({
@@ -335,12 +280,10 @@ export async function loadPrComments(options: CliOptions): Promise<LoadedPrComme
     repoOverride: options.repoOverride ?? repo.nameWithOwner
   });
 
-  const [issueResource, issueCommentsRaw, reviewCommentsRaw, reviewsRaw, timelineRaw] = await Promise.all([
+  const [issueResource, issueCommentsRaw, reviewCommentsRaw] = await Promise.all([
     ghJson<IssueResource>(["api", `repos/${repo.owner}/${repo.repo}/issues/${pr.number}`]),
     ghPaginatedArray<IssueComment>(`repos/${repo.owner}/${repo.repo}/issues/${pr.number}/comments`),
-    ghPaginatedArray<ReviewComment>(`repos/${repo.owner}/${repo.repo}/pulls/${pr.number}/comments`),
-    ghPaginatedArray<PullRequestReview>(`repos/${repo.owner}/${repo.repo}/pulls/${pr.number}/reviews`),
-    ghPaginatedArray<unknown>(`repos/${repo.owner}/${repo.repo}/issues/${pr.number}/timeline`)
+    ghPaginatedArray<ReviewComment>(`repos/${repo.owner}/${repo.repo}/pulls/${pr.number}/comments`)
   ]);
 
   const prDescription: IssueComment = {
@@ -358,7 +301,7 @@ export async function loadPrComments(options: CliOptions): Promise<LoadedPrComme
     ...issueCommentsRaw.map((comment) => ({ ...comment, is_pr_description: false }))
   ]);
   const reviewComments = normalizeReviewComments(reviewCommentsRaw);
-  const reviews = mergeTimelineReviewedEvents(normalizeReviews(reviewsRaw), timelineRaw);
+  const reviews: PullRequestReview[] = [];
   const inlineThreads = buildInlineThreads(reviewComments);
 
   return {
@@ -369,5 +312,33 @@ export async function loadPrComments(options: CliOptions): Promise<LoadedPrComme
     reviewComments,
     inlineThreads,
     reviews
+  };
+}
+
+export async function listOpenPrs(options: CliOptions): Promise<{
+  repo: RepoIdentity;
+  prs: PrListItem[];
+}> {
+  const repo = await resolveRepo(options.repoOverride);
+  const prs = await ghJson<PrListItem[]>([
+    "pr",
+    "list",
+    "--state",
+    "open",
+    "--limit",
+    "100",
+    "--json",
+    PR_LIST_FIELDS,
+    "--repo",
+    repo.nameWithOwner
+  ]);
+
+  const ordered = [...prs].sort((a, b) => {
+    return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
+  });
+
+  return {
+    repo,
+    prs: ordered
   };
 }

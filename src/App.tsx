@@ -1,22 +1,14 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Text, useInput, useStdin, useStdout } from "ink";
-import { countThreadReplies } from "./model.js";
 import type {
   InlineCommentNode,
-  InlineThread,
   IssueComment,
   LoadedPrComments,
-  PullRequestReview
+  PrListItem
 } from "./types.js";
 
-type TabKey = "discussion" | "threads" | "reviews";
 type PanelFocus = "list" | "detail";
-
-interface SummaryRow {
-  key: string;
-  headline: string;
-  subline: string;
-}
+const HTML_TAG_RE = /<\/?[a-z][a-z0-9-]*(?:\s[^>]*?)?\/?>/gi;
 
 interface InlineSpan {
   text: string;
@@ -24,7 +16,8 @@ interface InlineSpan {
   italic?: boolean;
   underline?: boolean;
   dim?: boolean;
-  color?: "blue" | "yellow" | "cyan" | "gray" | "white";
+  color?: "blue" | "yellow" | "cyan" | "gray" | "white" | "magenta" | "green";
+  link?: string;
 }
 
 interface MarkdownLine {
@@ -40,6 +33,28 @@ interface WrappedBodyLine {
   dim?: boolean;
 }
 
+interface MarkdownRenderOptions {
+  commitBaseUrl?: string;
+}
+
+interface UnifiedCommentRow {
+  key: string;
+  depth: number;
+  subline: string;
+  body: string;
+  htmlUrl: string;
+  createdAt: string;
+  author: string;
+  location: string;
+  kind: "discussion" | "inline";
+}
+
+interface SelectorRow {
+  key: string;
+  headline: string;
+  subline: string;
+}
+
 interface MouseSequence {
   code: number;
   x: number;
@@ -47,32 +62,130 @@ interface MouseSequence {
   kind: "M" | "m";
 }
 
-const TAB_ORDER: TabKey[] = ["discussion", "threads", "reviews"];
-const TAB_LABEL: Record<TabKey, string> = {
-  discussion: "Discussion",
-  threads: "Inline Threads",
-  reviews: "Reviews"
-};
-
-function pickDefaultTab(data: LoadedPrComments): TabKey {
-  if (data.issueComments.length > 0) {
-    return "discussion";
-  }
-  if (data.inlineThreads.length > 0) {
-    return "threads";
-  }
-  if (data.reviews.length > 0) {
-    return "reviews";
-  }
-  return "discussion";
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
 }
 
-function shortBody(body: string, max = 90): string {
-  const normalized = body.replace(/\s+/g, " ").trim();
-  if (!normalized) {
+const AUTHOR_COLOR_PALETTE: Array<NonNullable<InlineSpan["color"]>> = [
+  "cyan",
+  "green",
+  "magenta",
+  "blue",
+  "yellow"
+];
+
+function hashString(value: string): number {
+  let hash = 0;
+  for (let i = 0; i < value.length; i += 1) {
+    hash = (hash * 31 + value.charCodeAt(i)) >>> 0;
+  }
+  return hash;
+}
+
+function authorColor(login: string): NonNullable<InlineSpan["color"]> {
+  if (!login) {
+    return "white";
+  }
+
+  return AUTHOR_COLOR_PALETTE[hashString(login.toLowerCase()) % AUTHOR_COLOR_PALETTE.length];
+}
+
+function safeCodePoint(value: number): string {
+  if (!Number.isFinite(value) || value < 0 || value > 0x10ffff) {
+    return "";
+  }
+
+  try {
+    return String.fromCodePoint(value);
+  } catch {
+    return "";
+  }
+}
+
+function decodeHtmlEntities(input: string): string {
+  let output = input;
+  for (let i = 0; i < 4; i += 1) {
+    const before = output;
+    output = output
+      .replace(/&amp;/gi, "&")
+      .replace(/&lt;/gi, "<")
+      .replace(/&gt;/gi, ">")
+      .replace(/&quot;/gi, "\"")
+      .replace(/&#39;/gi, "'")
+      .replace(/&nbsp;/gi, " ")
+      .replace(/&#(\d+);/g, (_m, dec: string) => safeCodePoint(Number.parseInt(dec, 10)))
+      .replace(/&#x([0-9a-f]+);/gi, (_m, hex: string) =>
+        safeCodePoint(Number.parseInt(hex, 16))
+      );
+    if (output === before) {
+      break;
+    }
+  }
+
+  return output;
+}
+
+function truncateText(input: string, maxWidth: number): string {
+  const clean = input.replace(/\s+/g, " ").trim();
+  if (clean.length <= maxWidth) {
+    return clean;
+  }
+
+  if (maxWidth <= 3) {
+    return clean.slice(0, Math.max(0, maxWidth));
+  }
+
+  return `${clean.slice(0, maxWidth - 3)}...`;
+}
+
+function previewBody(body: string): string {
+  const normalized = normalizeBodyForDisplay(body).replace(/\s+/g, " ").trim();
+  return normalized || "(no body)";
+}
+
+function normalizeBodyForDisplay(input: string): string {
+  if (!input) {
     return "(no body)";
   }
-  return normalized.length > max ? `${normalized.slice(0, max - 1)}...` : normalized;
+
+  let output = decodeHtmlEntities(input);
+  output = output.replace(/\r\n/g, "\n");
+  output = output.replace(/<br\s*\/?>/gi, "\n");
+  output = output.replace(/<(div|section|article|header|footer|aside)[^>]*>/gi, "\n");
+  output = output.replace(/<\/(div|section|article|header|footer|aside)>\s*/gi, "\n");
+  output = output.replace(/<\/p>\s*/gi, "\n\n");
+  output = output.replace(/<p[^>]*>/gi, "");
+  output = output.replace(/<summary[^>]*>(.*?)<\/summary>/gi, "\n**$1**\n");
+  output = output.replace(/<(details|summary)[^>]*>/gi, "\n");
+  output = output.replace(/<\/(details|summary)>\s*/gi, "\n");
+  output = output.replace(/<blockquote[^>]*>/gi, "\n> ");
+  output = output.replace(/<\/blockquote>\s*/gi, "\n");
+  output = output.replace(/<li[^>]*>/gi, "- ");
+  output = output.replace(/<\/li>\s*/gi, "\n");
+  output = output.replace(/<(ul|ol)[^>]*>/gi, "\n");
+  output = output.replace(/<\/(ul|ol)>\s*/gi, "\n");
+  output = output.replace(/<(h[1-6])[^>]*>/gi, "\n## ");
+  output = output.replace(/<\/h[1-6]>\s*/gi, "\n");
+  output = output.replace(/<(strong|b)[^>]*>/gi, "**");
+  output = output.replace(/<\/(strong|b)>/gi, "**");
+  output = output.replace(/<(em|i)[^>]*>/gi, "*");
+  output = output.replace(/<\/(em|i)>/gi, "*");
+  output = output.replace(/<code[^>]*>/gi, "`");
+  output = output.replace(/<\/code>/gi, "`");
+  output = output.replace(/<pre[^>]*>/gi, "```\n");
+  output = output.replace(/<\/pre>/gi, "\n```");
+  output = output.replace(
+    /<a[^>]*href=["']([^"']+)["'][^>]*>(.*?)<\/a>/gi,
+    (_match, href: string, label: string) => {
+      const cleanLabel = decodeHtmlEntities(label.replace(HTML_TAG_RE, ""));
+      return `[${cleanLabel || href}](${href})`;
+    }
+  );
+  output = decodeHtmlEntities(output);
+  output = output.replace(HTML_TAG_RE, "");
+  output = decodeHtmlEntities(output);
+  output = output.replace(/\n{3,}/g, "\n\n").trim();
+  return output || "(no body)";
 }
 
 function author(login?: string | null): string {
@@ -98,6 +211,23 @@ function fmtDate(iso?: string | null): string {
   }).format(date);
 }
 
+function fmtTimeOfDay(timestamp?: number | null): string {
+  if (!timestamp) {
+    return "unknown";
+  }
+
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) {
+    return "unknown";
+  }
+
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit"
+  }).format(date);
+}
+
 function fmtRelativeOrAbsolute(iso?: string | null): string {
   if (!iso) {
     return "unknown time";
@@ -117,7 +247,76 @@ function fmtRelativeOrAbsolute(iso?: string | null): string {
   return fmtDate(iso);
 }
 
-function parseInlineSpans(input: string): InlineSpan[] {
+function toTimestamp(iso?: string | null): number {
+  if (!iso) {
+    return 0;
+  }
+
+  const timestamp = new Date(iso).getTime();
+  return Number.isNaN(timestamp) ? 0 : timestamp;
+}
+
+function parseMouseSequences(chunk: string): MouseSequence[] {
+  const events: MouseSequence[] = [];
+  const regex = /\u001B\[<(\d+);(\d+);(\d+)([mM])/g;
+  let match = regex.exec(chunk);
+
+  while (match) {
+    events.push({
+      code: Number.parseInt(match[1], 10),
+      x: Number.parseInt(match[2], 10),
+      y: Number.parseInt(match[3], 10),
+      kind: match[4] === "m" ? "m" : "M"
+    });
+    match = regex.exec(chunk);
+  }
+
+  return events;
+}
+
+function appendTextWithCommitLinks(
+  input: string,
+  target: InlineSpan[],
+  options: MarkdownRenderOptions
+): void {
+  if (!input) {
+    return;
+  }
+
+  const commitBaseUrl = options.commitBaseUrl?.replace(/\/+$/, "");
+  if (!commitBaseUrl) {
+    target.push({ text: input });
+    return;
+  }
+
+  // 7-40 hex chars with at least one letter to avoid matching plain numbers.
+  const commit = /\b(?=[0-9a-f]{7,40}\b)(?=[0-9a-f]*[a-f])[0-9a-f]+\b/gi;
+  let last = 0;
+  let match = commit.exec(input);
+
+  while (match) {
+    if (match.index > last) {
+      target.push({ text: input.slice(last, match.index) });
+    }
+
+    const hash = match[0];
+    target.push({
+      text: hash,
+      color: "blue",
+      underline: true,
+      link: `${commitBaseUrl}/commit/${hash}`
+    });
+
+    last = match.index + hash.length;
+    match = commit.exec(input);
+  }
+
+  if (last < input.length) {
+    target.push({ text: input.slice(last) });
+  }
+}
+
+function parseInlineSpans(input: string, options: MarkdownRenderOptions = {}): InlineSpan[] {
   const token = /(\[[^\]]+\]\(([^)]+)\)|\*\*[^*]+\*\*|`[^`]+`|\*[^*]+\*|_[^_]+_)/g;
   const spans: InlineSpan[] = [];
   let lastIndex = 0;
@@ -125,7 +324,7 @@ function parseInlineSpans(input: string): InlineSpan[] {
 
   while (match) {
     if (match.index > lastIndex) {
-      spans.push({ text: input.slice(lastIndex, match.index) });
+      appendTextWithCommitLinks(input.slice(lastIndex, match.index), spans, options);
     }
 
     const value = match[0];
@@ -155,14 +354,14 @@ function parseInlineSpans(input: string): InlineSpan[] {
   }
 
   if (lastIndex < input.length) {
-    spans.push({ text: input.slice(lastIndex) });
+    appendTextWithCommitLinks(input.slice(lastIndex), spans, options);
   }
 
   return spans;
 }
 
-function markdownToLines(text: string): MarkdownLine[] {
-  const sourceLines = (text || "(no body)").split(/\r?\n/);
+function markdownToLines(text: string, options: MarkdownRenderOptions = {}): MarkdownLine[] {
+  const sourceLines = normalizeBodyForDisplay(text || "(no body)").split(/\r?\n/);
   const output: MarkdownLine[] = [];
   let inFence = false;
 
@@ -188,11 +387,11 @@ function markdownToLines(text: string): MarkdownLine[] {
       continue;
     }
 
-    const heading = sourceLine.match(/^\s{0,3}(#{1,6})\s+(.*)$/);
+    const heading = sourceLine.match(/^\s*(#{1,6})\s+(.*)$/);
     if (heading) {
       output.push({
         prefix: "",
-        spans: parseInlineSpans(heading[2]),
+        spans: parseInlineSpans(heading[2], options),
         color: "cyan"
       });
       continue;
@@ -202,7 +401,7 @@ function markdownToLines(text: string): MarkdownLine[] {
     if (quote) {
       output.push({
         prefix: "> ",
-        spans: parseInlineSpans(quote[1]),
+        spans: parseInlineSpans(quote[1], options),
         dim: true
       });
       continue;
@@ -212,7 +411,7 @@ function markdownToLines(text: string): MarkdownLine[] {
     if (bullet) {
       output.push({
         prefix: "• ",
-        spans: parseInlineSpans(bullet[1])
+        spans: parseInlineSpans(bullet[1], options)
       });
       continue;
     }
@@ -221,14 +420,14 @@ function markdownToLines(text: string): MarkdownLine[] {
     if (numbered) {
       output.push({
         prefix: `${numbered[1]}. `,
-        spans: parseInlineSpans(numbered[2])
+        spans: parseInlineSpans(numbered[2], options)
       });
       continue;
     }
 
     output.push({
       prefix: "",
-      spans: parseInlineSpans(sourceLine)
+      spans: parseInlineSpans(sourceLine, options)
     });
   }
 
@@ -236,6 +435,13 @@ function markdownToLines(text: string): MarkdownLine[] {
 }
 
 function InlineText({ spans }: { spans: InlineSpan[] }): JSX.Element {
+  const OSC = "\u001B]8;;";
+  const BEL = "\u0007";
+
+  const hyperlink = (text: string, url: string): string => {
+    return `${OSC}${url}${BEL}${text}${OSC}${BEL}`;
+  };
+
   return (
     <>
       {spans.map((span, idx) => (
@@ -247,7 +453,7 @@ function InlineText({ spans }: { spans: InlineSpan[] }): JSX.Element {
           dimColor={Boolean(span.dim)}
           color={span.color}
         >
-          {span.text}
+          {span.link ? hyperlink(span.text, span.link) : span.text}
         </Text>
       ))}
     </>
@@ -297,6 +503,47 @@ function pushWrappedSpan(target: InlineSpan[], next: InlineSpan): void {
   }
 
   target.push({ ...next });
+}
+
+function spanTextLength(spans: InlineSpan[]): number {
+  return spans.reduce((sum, span) => sum + span.text.length, 0);
+}
+
+function trimStyledSpans(spans: InlineSpan[], maxChars: number): InlineSpan[] {
+  if (maxChars <= 0) {
+    return [];
+  }
+
+  const total = spanTextLength(spans);
+  if (total <= maxChars) {
+    return spans.map((span) => ({ ...span }));
+  }
+
+  if (maxChars <= 3) {
+    return [{ text: ".".repeat(maxChars), dim: true }];
+  }
+
+  const keep = maxChars - 3;
+  const output: InlineSpan[] = [];
+  let remaining = keep;
+
+  for (const span of spans) {
+    if (remaining <= 0) {
+      break;
+    }
+
+    if (span.text.length <= remaining) {
+      pushWrappedSpan(output, { ...span });
+      remaining -= span.text.length;
+      continue;
+    }
+
+    pushWrappedSpan(output, { ...span, text: span.text.slice(0, remaining) });
+    remaining = 0;
+  }
+
+  pushWrappedSpan(output, { text: "...", dim: true });
+  return output;
 }
 
 function wrapMarkdownLine(line: MarkdownLine, baseIndent: number, wrapWidth: number): WrappedBodyLine[] {
@@ -368,8 +615,13 @@ function wrapMarkdownLine(line: MarkdownLine, baseIndent: number, wrapWidth: num
   return output;
 }
 
-function countWrappedMarkdownLines(text: string, indent: number, wrapWidth: number): number {
-  return markdownToLines(text).flatMap((line) => wrapMarkdownLine(line, indent, wrapWidth)).length;
+function countWrappedMarkdownLines(
+  text: string,
+  indent: number,
+  wrapWidth: number,
+  options: MarkdownRenderOptions = {}
+): number {
+  return markdownToLines(text, options).flatMap((line) => wrapMarkdownLine(line, indent, wrapWidth)).length;
 }
 
 function countWrappedPlainLines(text: string, wrapWidth: number): number {
@@ -383,45 +635,39 @@ function countWrappedPlainLines(text: string, wrapWidth: number): number {
   }, 0);
 }
 
-function flattenThreadContent(root: InlineCommentNode): string {
-  const lines: string[] = [];
+function formatCommentListLine({
+  selected,
+  depth,
+  authorName,
+  preview,
+  when,
+  width
+}: {
+  selected: boolean;
+  depth: number;
+  authorName: string;
+  preview: string;
+  when: string;
+  width: number;
+}): InlineSpan[] {
+  const safeWidth = Math.max(8, width);
+  const safeWhen = truncateText(when, Math.max(2, safeWidth - 2));
+  const maxLeft = Math.max(1, safeWidth - safeWhen.length - 1);
+  const leftSpans: InlineSpan[] = [
+    { text: selected ? "> " : "  ", color: selected ? "yellow" : "gray" },
+    { text: " ".repeat(Math.max(0, depth) * 2) },
+    { text: authorName, color: authorColor(authorName), bold: true },
+    { text: " " },
+    { text: preview, dim: depth > 0 }
+  ];
 
-  const walk = (node: InlineCommentNode, depth: number): void => {
-    const indent = " ".repeat(depth * 2);
-    lines.push(`${indent}${author(node.comment.user?.login)}  ${fmtRelativeOrAbsolute(node.comment.created_at)}  id:${node.comment.id}`);
-    lines.push(`${indent}${lineRef(node.comment.path, node.comment.line, node.comment.original_line)}`);
-
-    const bodyLines = (node.comment.body || "(no body)").split(/\r?\n/);
-    for (const bodyLine of bodyLines) {
-      lines.push(`${indent}${bodyLine}`);
-    }
-
-    for (const child of node.children) {
-      lines.push("");
-      walk(child, depth + 1);
-    }
-  };
-
-  walk(root, 0);
-  return lines.join("\n");
-}
-
-function parseMouseSequences(chunk: string): MouseSequence[] {
-  const events: MouseSequence[] = [];
-  const regex = /\u001B\[<(\d+);(\d+);(\d+)([mM])/g;
-  let match = regex.exec(chunk);
-
-  while (match) {
-    events.push({
-      code: Number.parseInt(match[1], 10),
-      x: Number.parseInt(match[2], 10),
-      y: Number.parseInt(match[3], 10),
-      kind: match[4] === "m" ? "m" : "M"
-    });
-    match = regex.exec(chunk);
-  }
-
-  return events;
+  const trimmedLeft = trimStyledSpans(leftSpans, maxLeft);
+  const gap = Math.max(1, safeWidth - spanTextLength(trimmedLeft) - safeWhen.length);
+  return [
+    ...trimmedLeft,
+    { text: " ".repeat(gap) },
+    { text: safeWhen, color: "gray", dim: true }
+  ];
 }
 
 function Body({
@@ -429,15 +675,19 @@ function Body({
   indent = 0,
   maxLines,
   startLine = 0,
-  wrapWidth
+  wrapWidth,
+  renderOptions
 }: {
   text: string;
   indent?: number;
   maxLines?: number;
   startLine?: number;
   wrapWidth: number;
+  renderOptions?: MarkdownRenderOptions;
 }): JSX.Element {
-  const wrapped = markdownToLines(text).flatMap((line) => wrapMarkdownLine(line, indent, wrapWidth));
+  const wrapped = markdownToLines(text, renderOptions).flatMap((line) =>
+    wrapMarkdownLine(line, indent, wrapWidth)
+  );
   const hasWrapped = wrapped.length > 0;
   const safeStart = hasWrapped ? clamp(startLine, 0, wrapped.length - 1) : 0;
 
@@ -483,172 +733,160 @@ function Body({
   );
 }
 
-function ThreadNode({
-  node,
-  depth,
-  maxBodyLines,
-  wrapWidth
-}: {
-  node: InlineCommentNode;
-  depth: number;
-  maxBodyLines: number;
-  wrapWidth: number;
-}): JSX.Element {
-  const indent = depth * 2;
-  const who = author(node.comment.user?.login);
-  const when = fmtRelativeOrAbsolute(node.comment.created_at);
-  return (
-    <Box flexDirection="column" marginBottom={1}>
-      <Text color={depth === 0 ? "cyan" : "gray"} wrap="wrap">
-        {`${" ".repeat(indent)}${who}  ${when}  id:${node.comment.id}`}
-      </Text>
-      <Text dimColor wrap="wrap">{`${" ".repeat(indent)}${lineRef(node.comment.path, node.comment.line, node.comment.original_line)}`}</Text>
-      <Body text={node.comment.body} indent={indent} maxLines={maxBodyLines} wrapWidth={wrapWidth} />
-      {node.children.map((child) => (
-        <ThreadNode
-          key={child.comment.id}
-          node={child}
-          depth={depth + 1}
-          maxBodyLines={maxBodyLines}
-          wrapWidth={wrapWidth}
-        />
-      ))}
-    </Box>
-  );
+function latestTimestamp(node: InlineCommentNode): number {
+  let latest = toTimestamp(node.comment.created_at);
+  for (const child of node.children) {
+    latest = Math.max(latest, latestTimestamp(child));
+  }
+  return latest;
 }
 
-function discussionRows(comments: IssueComment[]): SummaryRow[] {
-  return comments.map((comment) => ({
+function discussionRow(comment: IssueComment): UnifiedCommentRow {
+  return {
     key: `discussion-${comment.id}`,
-    headline: `${comment.is_pr_description ? "PR Description" : "Comment"}  ${author(comment.user?.login)}  ${fmtRelativeOrAbsolute(comment.created_at)}`,
-    subline: shortBody(comment.body)
-  }));
+    depth: 0,
+    subline: previewBody(comment.body),
+    body: comment.body || "(no body)",
+    htmlUrl: comment.html_url,
+    createdAt: comment.created_at,
+    author: author(comment.user?.login),
+    location: "general",
+    kind: "discussion"
+  };
 }
 
-function threadRows(threads: InlineThread[]): SummaryRow[] {
-  return threads.map((thread) => {
-    const root = thread.root.comment;
-    const replies = countThreadReplies(thread.root);
-    const at = lineRef(root.path, root.line, root.original_line);
-    return {
-      key: `thread-${root.id}`,
-      headline: `${author(root.user?.login)}  ${fmtRelativeOrAbsolute(root.created_at)}  ${at}  ${replies} repl${replies === 1 ? "y" : "ies"}`,
-      subline: shortBody(root.body)
-    };
-  });
+function inlineRows(node: InlineCommentNode, depth: number): UnifiedCommentRow[] {
+  const row: UnifiedCommentRow = {
+    key: `inline-${node.comment.id}`,
+    depth,
+    subline: previewBody(node.comment.body),
+    body: node.comment.body || "(no body)",
+    htmlUrl: node.comment.html_url,
+    createdAt: node.comment.created_at,
+    author: author(node.comment.user?.login),
+    location: lineRef(node.comment.path, node.comment.line, node.comment.original_line),
+    kind: "inline"
+  };
+
+  const children = node.children.flatMap((child) => inlineRows(child, depth + 1));
+  return [row, ...children];
 }
 
-function reviewRows(reviews: PullRequestReview[]): SummaryRow[] {
-  return reviews.map((review) => ({
-    key: `review-${review.id}`,
-    headline: `${author(review.user?.login)}  ${review.state}  ${fmtRelativeOrAbsolute(review.submitted_at)}`,
-    subline: shortBody(review.body)
-  }));
+function buildUnifiedRows(data: LoadedPrComments): UnifiedCommentRow[] {
+  const grouped: Array<{ sort: number; rows: UnifiedCommentRow[] }> = [];
+
+  for (const comment of data.issueComments) {
+    grouped.push({
+      sort: toTimestamp(comment.created_at),
+      rows: [discussionRow(comment)]
+    });
+  }
+
+  for (const thread of data.inlineThreads) {
+    grouped.push({
+      sort: latestTimestamp(thread.root),
+      rows: inlineRows(thread.root, 0)
+    });
+  }
+
+  grouped.sort((a, b) => a.sort - b.sort);
+  return grouped.flatMap((item) => item.rows);
 }
 
-function clamp(value: number, min: number, max: number): number {
-  return Math.max(min, Math.min(max, value));
-}
-
-export function CommentsViewer({
-  data,
+export function PrSelector({
+  repoName,
+  prs,
+  preferredPrNumber,
+  isRefreshing,
+  error,
+  onRefresh,
+  onSelect,
   onExitRequest
 }: {
-  data: LoadedPrComments;
+  repoName: string;
+  prs: PrListItem[];
+  preferredPrNumber: number | null;
+  isRefreshing: boolean;
+  error: string | null;
+  onRefresh: () => void;
+  onSelect: (prNumber: number) => void;
   onExitRequest: () => void;
 }): JSX.Element {
-  const { isRawModeSupported, stdin } = useStdin();
+  const { isRawModeSupported } = useStdin();
   const { stdout } = useStdout();
-  const [activeTab, setActiveTab] = useState<TabKey>(() => pickDefaultTab(data));
-  const [panelFocus, setPanelFocus] = useState<PanelFocus>("list");
-  const [detailOffset, setDetailOffset] = useState(0);
-  const [indices, setIndices] = useState<Record<TabKey, number>>({
-    discussion: 0,
-    threads: 0,
-    reviews: 0
-  });
 
-  const rowsByTab = useMemo(
-    () => ({
-      discussion: discussionRows(data.issueComments),
-      threads: threadRows(data.inlineThreads),
-      reviews: reviewRows(data.reviews)
-    }),
-    [data]
-  );
+  const initialIndex = useMemo(() => {
+    if (preferredPrNumber === null) {
+      return 0;
+    }
 
-  const activeRows = rowsByTab[activeTab];
-  const maxIndex = Math.max(0, activeRows.length - 1);
-  const activeIndex = clamp(indices[activeTab], 0, maxIndex);
+    const found = prs.findIndex((pr) => pr.number === preferredPrNumber);
+    return found >= 0 ? found : 0;
+  }, [preferredPrNumber, prs]);
 
+  const [activeIndex, setActiveIndex] = useState(initialIndex);
+
+  useEffect(() => {
+    setActiveIndex(initialIndex);
+  }, [initialIndex]);
+
+  useEffect(() => {
+    if (!isRawModeSupported) {
+      onExitRequest();
+    }
+  }, [isRawModeSupported, onExitRequest]);
+
+  const maxIndex = Math.max(0, prs.length - 1);
+  const safeIndex = clamp(activeIndex, 0, maxIndex);
   const terminalRows = stdout.rows || 24;
   const terminalCols = stdout.columns || 80;
-  const detailWrapWidth = Math.max(24, terminalCols - 8);
-  const listWrapWidth = Math.max(24, terminalCols - 10);
-  const helpText = isRawModeSupported
-    ? "Keys: Tab focus, j/k or arrows scroll, PgUp/PgDn page, h/l or 1/2/3 switch tabs, mouse wheel scroll, q quit"
-    : "Non-interactive terminal detected: rendered once and exiting.";
-  const threadContextText = `PR Context: #${data.pr.number} ${data.pr.title}`;
-
+  const listWrapWidth = Math.max(24, terminalCols - 8);
   const appWrapWidth = Math.max(16, terminalCols - 2);
-  const titleText = `ghr  ${data.repo.nameWithOwner}  #${data.pr.number}  ${data.pr.title}`;
-  const prText = `PR: ${data.pr.url}`;
-  const inferenceText = `Inference: ${data.prInference}`;
-  const countsText = `Counts: discussion ${data.issueComments.length} | inline comments ${data.reviewComments.length} | inline threads ${data.inlineThreads.length} | reviews ${data.reviews.length}`;
-  const tabsText = TAB_ORDER.map((tab, index) => `${index + 1}. ${TAB_LABEL[tab]}`).join("   ");
+  const titleText = `ghr  ${repoName}`;
+  const statusText = `Open PRs: ${prs.length}${isRefreshing ? " | refreshing..." : ""}`;
+  const helpText = isRawModeSupported
+    ? "Keys: up/down or j/k move, Enter open PR, r refresh list, q quit"
+    : "Non-interactive terminal detected: rendered once and exiting.";
   const topHeaderLines =
     countWrappedPlainLines(titleText, appWrapWidth) +
-    countWrappedPlainLines(prText, appWrapWidth) +
-    countWrappedPlainLines(inferenceText, appWrapWidth) +
-    countWrappedPlainLines(countsText, appWrapWidth);
-  const tabsLineCount = countWrappedPlainLines(tabsText, appWrapWidth);
-  const helpLineCount = countWrappedPlainLines(helpText, appWrapWidth);
-
-  const panelRowsAvailable = Math.max(
-    10,
-    terminalRows - (topHeaderLines + tabsLineCount + helpLineCount + 3)
+    countWrappedPlainLines(statusText, appWrapWidth) +
+    (error ? countWrappedPlainLines(error, appWrapWidth) : 0);
+  const helpLines = countWrappedPlainLines(helpText, appWrapWidth);
+  const listPanelHeight = Math.max(8, terminalRows - (topHeaderLines + helpLines + 5));
+  const listContentBudget = Math.max(1, listPanelHeight - 3);
+  const listWindow = clamp(
+    Math.max(2, Math.floor(listContentBudget / 2) + 1),
+    2,
+    Math.max(2, prs.length)
   );
-  const preferredDetailPanelHeight = Math.max(6, Math.floor(panelRowsAvailable * 0.65));
-  const detailPanelHeight = clamp(
-    preferredDetailPanelHeight,
-    6,
-    Math.max(6, panelRowsAvailable - 4)
-  );
-  const listPanelHeight = Math.max(4, panelRowsAvailable - detailPanelHeight);
-  const detailPanelInnerHeight = Math.max(1, detailPanelHeight - 2);
-  const listThreadContextLines = activeTab === "threads"
-    ? countWrappedPlainLines(threadContextText, listWrapWidth)
-    : 0;
-  const listContentBudget = Math.max(1, listPanelHeight - 2 - 1 - listThreadContextLines);
-  const listWindow = clamp(Math.max(2, Math.floor(listContentBudget / 2) + 1), 2, 8);
   const listPageStep = Math.max(1, listWindow - 1);
+  const listStart = clamp(
+    safeIndex - Math.floor(listWindow / 2),
+    0,
+    Math.max(0, prs.length - listWindow)
+  );
 
-  const listStart = clamp(activeIndex - Math.floor(listWindow / 2), 0, Math.max(0, activeRows.length - listWindow));
   const visibleRows = useMemo(() => {
-    return activeRows.slice(listStart, listStart + listWindow).map((row, idx) => {
+    return prs.slice(listStart, listStart + listWindow).map((pr, idx) => {
       const absolute = listStart + idx;
-      const selected = absolute === activeIndex;
-      const headlineText = `${selected ? ">" : " "} [${absolute + 1}] ${row.headline}`;
-      const headlineLines = wrapMarkdownLine(
-        { prefix: "", spans: [{ text: headlineText }] },
-        0,
-        listWrapWidth
-      );
-      const sublineLines = wrapMarkdownLine(
-        { prefix: "", spans: [{ text: `    ${row.subline}` }] },
-        0,
-        listWrapWidth
-      );
+      const selected = absolute === safeIndex;
+      const row: SelectorRow = {
+        key: `selector-${pr.number}`,
+        headline: `${selected ? ">" : " "} [${absolute + 1}] #${pr.number} ${pr.title}`,
+        subline: `    ${pr.headRefName} -> ${pr.baseRefName}  updated ${fmtRelativeOrAbsolute(pr.updatedAt)}`
+      };
+
       return {
         row,
         selected,
-        headlineLines,
-        sublineLines
+        headlineLines: wrapMarkdownLine({ prefix: "", spans: [{ text: row.headline }] }, 0, listWrapWidth),
+        sublineLines: wrapMarkdownLine({ prefix: "", spans: [{ text: row.subline }] }, 0, listWrapWidth)
       };
     });
-  }, [activeRows, listStart, listWindow, activeIndex, listWrapWidth]);
+  }, [prs, listStart, listWindow, safeIndex, listWrapWidth]);
+
   const renderedRows = useMemo(() => {
-    if (activeRows.length === 0) {
+    if (prs.length === 0) {
       return [];
     }
 
@@ -676,95 +914,255 @@ export function CommentsViewer({
     }
 
     return output;
-  }, [activeRows.length, listContentBudget, visibleRows]);
+  }, [prs.length, listContentBudget, visibleRows]);
+
+  useInput(
+    (input, key) => {
+      if (input === "q" || key.escape || (key.ctrl && input === "c")) {
+        onExitRequest();
+        return;
+      }
+
+      if (input === "r") {
+        onRefresh();
+        return;
+      }
+
+      if (key.return && prs[safeIndex]) {
+        onSelect(prs[safeIndex].number);
+        return;
+      }
+
+      if (input === "g") {
+        setActiveIndex(0);
+        return;
+      }
+
+      if (input === "G") {
+        setActiveIndex(maxIndex);
+        return;
+      }
+
+      if ((key as { pageDown?: boolean }).pageDown) {
+        setActiveIndex((prev) => clamp(prev + listPageStep, 0, maxIndex));
+        return;
+      }
+
+      if ((key as { pageUp?: boolean }).pageUp) {
+        setActiveIndex((prev) => clamp(prev - listPageStep, 0, maxIndex));
+        return;
+      }
+
+      if (key.downArrow || input === "j") {
+        setActiveIndex((prev) => clamp(prev + 1, 0, maxIndex));
+        return;
+      }
+
+      if (key.upArrow || input === "k") {
+        setActiveIndex((prev) => clamp(prev - 1, 0, maxIndex));
+      }
+    },
+    { isActive: Boolean(isRawModeSupported) }
+  );
+
+  return (
+    <Box flexDirection="column" paddingX={1}>
+      <Text color="green" wrap="wrap">
+        {titleText}
+      </Text>
+      <Text dimColor wrap="wrap">
+        {statusText}
+      </Text>
+      {error && (
+        <Text color="red" wrap="wrap">
+          {error}
+        </Text>
+      )}
+
+      <Box marginTop={1} flexDirection="column" borderStyle="round" paddingX={1} height={listPanelHeight}>
+        <Text color="cyan" wrap="wrap">
+          Select Pull Request
+        </Text>
+        {prs.length === 0 ? (
+          <Text dimColor wrap="wrap">
+            No open pull requests found. Press r to refresh, or q to quit.
+          </Text>
+        ) : (
+          renderedRows.map((item) => (
+            <Box key={item.row.key} flexDirection="column">
+              {item.headlineLines.map((line, lineIdx) => (
+                <Text
+                  key={`selector-headline-${item.row.key}-${lineIdx}`}
+                  color={item.selected ? "yellow" : "white"}
+                  wrap="wrap"
+                >
+                  {""}
+                  <InlineText spans={line.spans} />
+                </Text>
+              ))}
+              {item.sublineLines.map((line, lineIdx) => (
+                <Text key={`selector-subline-${item.row.key}-${lineIdx}`} dimColor wrap="wrap">
+                  {""}
+                  <InlineText spans={line.spans} />
+                </Text>
+              ))}
+            </Box>
+          ))
+        )}
+      </Box>
+
+      <Box marginTop={1}>
+        <Text dimColor wrap="wrap">
+          {helpText}
+        </Text>
+      </Box>
+    </Box>
+  );
+}
+
+export function CommentsViewer({
+  data,
+  openPrCount,
+  onExitRequest,
+  onBackToPrSelection,
+  autoRefreshIntervalMs,
+  isRefreshing,
+  lastUpdatedAt,
+  refreshError
+}: {
+  data: LoadedPrComments;
+  openPrCount: number;
+  onExitRequest: () => void;
+  onBackToPrSelection: () => void;
+  autoRefreshIntervalMs: number;
+  isRefreshing: boolean;
+  lastUpdatedAt: number | null;
+  refreshError: string | null;
+}): JSX.Element {
+  const { isRawModeSupported, stdin } = useStdin();
+  const { stdout } = useStdout();
+  const rows = useMemo(() => buildUnifiedRows(data), [data]);
+  const [panelFocus, setPanelFocus] = useState<PanelFocus>("list");
+  const [mouseCaptureEnabled, setMouseCaptureEnabled] = useState(true);
+  const [activeIndex, setActiveIndex] = useState(0);
+  const [detailOffset, setDetailOffset] = useState(0);
+  const commitBaseUrl = `https://github.com/${data.repo.nameWithOwner}`;
+
+  const maxIndex = Math.max(0, rows.length - 1);
+  const safeActiveIndex = clamp(activeIndex, 0, maxIndex);
+  const selectedRow = rows[safeActiveIndex];
+
+  useEffect(() => {
+    setActiveIndex((prev) => clamp(prev, 0, maxIndex));
+  }, [maxIndex]);
+
+  useEffect(() => {
+    setDetailOffset(0);
+  }, [safeActiveIndex, selectedRow?.key]);
+
+  useEffect(() => {
+    if (!isRawModeSupported) {
+      onExitRequest();
+    }
+  }, [isRawModeSupported, onExitRequest]);
+
+  const terminalRows = stdout.rows || 24;
+  const terminalCols = stdout.columns || 80;
+  const listWrapWidth = Math.max(24, terminalCols - 10);
+  const detailWrapWidth = Math.max(24, terminalCols - 8);
+  const appWrapWidth = Math.max(16, terminalCols - 2);
+  const refreshEvery = autoRefreshIntervalMs % 1000 === 0
+    ? `${autoRefreshIntervalMs / 1000}s`
+    : `${(autoRefreshIntervalMs / 1000).toFixed(1)}s`;
+  const titleText = `ghr  ${data.repo.nameWithOwner}  #${data.pr.number}  ${data.pr.title}`;
+  const prText = `PR: ${data.pr.url}`;
+  const inferenceText = `Inference: ${data.prInference}`;
+  const selectionText = `Open PRs: ${openPrCount} | mouse capture ${mouseCaptureEnabled ? "on" : "off"}`;
+  const refreshStatusText = `Auto refresh: every ${refreshEvery} | last update ${fmtTimeOfDay(lastUpdatedAt)}${isRefreshing ? " | refreshing..." : ""}`;
+  const refreshErrorText = refreshError ? `Last refresh failed: ${refreshError}` : "";
+  const helpText = isRawModeSupported
+    ? "Keys: j/k move, Tab focus, b PR list, m mouse capture, q quit"
+    : "Non-interactive terminal detected: rendered once and exiting.";
+  const topHeaderLines =
+    countWrappedPlainLines(titleText, appWrapWidth) +
+    countWrappedPlainLines(prText, appWrapWidth) +
+    countWrappedPlainLines(inferenceText, appWrapWidth) +
+    countWrappedPlainLines(selectionText, appWrapWidth) +
+    countWrappedPlainLines(refreshStatusText, appWrapWidth) +
+    (refreshError ? countWrappedPlainLines(refreshErrorText, appWrapWidth) : 0);
+  const helpLineCount = countWrappedPlainLines(helpText, appWrapWidth);
+  const panelRowsAvailable = Math.max(9, terminalRows - (topHeaderLines + helpLineCount + 4));
+  const listPanelHeight = clamp(
+    Math.floor(panelRowsAvailable * 0.35),
+    5,
+    Math.max(5, panelRowsAvailable - 6)
+  );
+  const detailPanelHeight = Math.max(6, panelRowsAvailable - listPanelHeight);
+  const detailPanelInnerHeight = Math.max(1, detailPanelHeight - 2);
+  const listContentBudget = Math.max(1, listPanelHeight - 3);
+  const listWindow = clamp(listContentBudget, 1, Math.max(1, rows.length));
+  const listPageStep = Math.max(1, listWindow - 1);
+  const listStart = clamp(
+    safeActiveIndex - Math.floor(listWindow / 2),
+    0,
+    Math.max(0, rows.length - listWindow)
+  );
+
+  const visibleRows = useMemo(() => {
+    return rows.slice(listStart, listStart + listWindow).map((row, idx) => {
+      const absolute = listStart + idx;
+      const selected = absolute === safeActiveIndex;
+      const when = fmtRelativeOrAbsolute(row.createdAt);
+      const spans = formatCommentListLine({
+        selected,
+        depth: row.depth,
+        authorName: row.author,
+        preview: row.subline,
+        when,
+        width: listWrapWidth
+      });
+      return { row, selected, spans };
+    });
+  }, [rows, listStart, listWindow, safeActiveIndex, listWrapWidth]);
 
   let layoutCursor = 0;
   layoutCursor += topHeaderLines;
-  layoutCursor += 1; // tabs marginTop
-  layoutCursor += tabsLineCount;
   layoutCursor += 1; // list marginTop
   const listPanelTopRow = layoutCursor + 1;
   layoutCursor += listPanelHeight;
   const detailPanelTopRow = layoutCursor + 1;
 
-  const selectedThread = data.inlineThreads[activeIndex];
-  const selectedDiscussion = data.issueComments[activeIndex];
-  const selectedReview = data.reviews[activeIndex];
-  const discussionDetailHeadline = selectedDiscussion
-    ? `${selectedDiscussion.is_pr_description ? "PR Description" : "Comment"}  ${author(selectedDiscussion.user?.login)}  ${fmtRelativeOrAbsolute(selectedDiscussion.created_at)}  id:${selectedDiscussion.id}`
+  const detailTitle = selectedRow
+    ? `${selectedRow.kind === "discussion" ? "Discussion" : "Inline"}  ${selectedRow.author}  ${fmtRelativeOrAbsolute(selectedRow.createdAt)}`
     : "";
-  const threadDetailHeadline = selectedThread ? `Thread root id: ${selectedThread.root.comment.id}` : "";
-  const reviewDetailHeadline = selectedReview
-    ? `${author(selectedReview.user?.login)}  ${selectedReview.state}  ${fmtRelativeOrAbsolute(selectedReview.submitted_at)}  id:${selectedReview.id}`
-    : "";
-
-  const detailContextLines = activeTab === "threads"
-    ? countWrappedPlainLines(threadContextText, detailWrapWidth)
-    : 0;
-  let detailLinesAboveBody = 1 + detailContextLines;
-  if (activeRows.length === 0) {
+  const detailLocation = selectedRow ? `Location: ${selectedRow.location}` : "";
+  const detailUrl = selectedRow?.htmlUrl || "";
+  let detailLinesAboveBody = 1;
+  if (!selectedRow) {
     detailLinesAboveBody += 1;
-  } else if (activeTab === "discussion" && selectedDiscussion) {
-    detailLinesAboveBody +=
-      countWrappedPlainLines(discussionDetailHeadline, detailWrapWidth) +
-      countWrappedPlainLines(selectedDiscussion.html_url, detailWrapWidth);
-  } else if (activeTab === "threads" && selectedThread) {
-    detailLinesAboveBody +=
-      countWrappedPlainLines(threadDetailHeadline, detailWrapWidth) +
-      countWrappedPlainLines(selectedThread.root.comment.html_url, detailWrapWidth);
-  } else if (activeTab === "reviews" && selectedReview) {
-    detailLinesAboveBody +=
-      countWrappedPlainLines(reviewDetailHeadline, detailWrapWidth) +
-      countWrappedPlainLines(selectedReview.html_url, detailWrapWidth);
   } else {
-    detailLinesAboveBody += 1;
+    detailLinesAboveBody += countWrappedPlainLines(detailTitle, detailWrapWidth);
+    detailLinesAboveBody += countWrappedPlainLines(detailLocation, detailWrapWidth);
+    detailLinesAboveBody += countWrappedPlainLines(detailUrl, detailWrapWidth);
   }
   const detailBodyLines = Math.max(1, detailPanelInnerHeight - detailLinesAboveBody);
   const detailPageStep = Math.max(1, detailBodyLines - 1);
-
-  const detailBodyText = useMemo(() => {
-    if (activeTab === "discussion") {
-      return selectedDiscussion?.body || "";
-    }
-    if (activeTab === "reviews") {
-      return selectedReview?.body || "";
-    }
-    if (activeTab === "threads") {
-      return selectedThread ? flattenThreadContent(selectedThread.root) : "";
-    }
-    return "";
-  }, [activeTab, selectedDiscussion, selectedReview, selectedThread]);
-
+  const detailBodyText = selectedRow?.body || "(no body)";
   const detailLineCount = useMemo(() => {
-    return countWrappedMarkdownLines(detailBodyText || "(no body)", 0, detailWrapWidth);
-  }, [detailBodyText, detailWrapWidth]);
-
+    return countWrappedMarkdownLines(detailBodyText, 0, detailWrapWidth, { commitBaseUrl });
+  }, [commitBaseUrl, detailBodyText, detailWrapWidth]);
   const maxDetailOffset = Math.max(0, detailLineCount - detailBodyLines);
 
-  const setTab = useCallback((tab: TabKey): void => {
-    setActiveTab(tab);
-    setIndices((prev) => ({
-      ...prev,
-      [tab]: clamp(prev[tab], 0, Math.max(0, rowsByTab[tab].length - 1))
-    }));
-  }, [rowsByTab]);
+  useEffect(() => {
+    setDetailOffset((prev) => clamp(prev, 0, maxDetailOffset));
+  }, [maxDetailOffset]);
 
   const moveIndex = useCallback((delta: number): void => {
-    setIndices((prev) => {
-      const current = prev[activeTab];
-      const next = clamp(current + delta, 0, Math.max(0, rowsByTab[activeTab].length - 1));
-      if (next === current) {
-        return prev;
-      }
-      return { ...prev, [activeTab]: next };
-    });
-  }, [activeTab, rowsByTab]);
+    setActiveIndex((prev) => clamp(prev + delta, 0, maxIndex));
+  }, [maxIndex]);
 
   const moveDetail = useCallback((delta: number): void => {
-    setDetailOffset((prev) => {
-      const next = clamp(prev + delta, 0, maxDetailOffset);
-      return next === prev ? prev : next;
-    });
+    setDetailOffset((prev) => clamp(prev + delta, 0, maxDetailOffset));
   }, [maxDetailOffset]);
 
   const panelFocusRef = useRef(panelFocus);
@@ -782,114 +1180,7 @@ export function CommentsViewer({
   }, [panelFocus, listPanelTopRow, detailPanelTopRow, moveIndex, moveDetail]);
 
   useEffect(() => {
-    setDetailOffset(0);
-  }, [activeTab, activeIndex]);
-
-  useEffect(() => {
-    setDetailOffset((prev) => clamp(prev, 0, maxDetailOffset));
-  }, [maxDetailOffset]);
-
-  useInput(
-    (input, key) => {
-      if (input === "q" || key.escape || (key.ctrl && input === "c")) {
-        onExitRequest();
-        return;
-      }
-
-      if (input === "1") {
-        setTab("discussion");
-        return;
-      }
-      if (input === "2") {
-        setTab("threads");
-        return;
-      }
-      if (input === "3") {
-        setTab("reviews");
-        return;
-      }
-
-      if (key.leftArrow || input === "h") {
-        const pos = TAB_ORDER.indexOf(activeTab);
-        setTab(TAB_ORDER[(pos - 1 + TAB_ORDER.length) % TAB_ORDER.length]);
-        return;
-      }
-
-      if (key.rightArrow || input === "l") {
-        const pos = TAB_ORDER.indexOf(activeTab);
-        setTab(TAB_ORDER[(pos + 1) % TAB_ORDER.length]);
-        return;
-      }
-
-      if (key.tab || input === "\t") {
-        setPanelFocus((prev) => (prev === "list" ? "detail" : "list"));
-        return;
-      }
-
-      if (input === "g") {
-        if (panelFocus === "list") {
-          moveIndex(-maxIndex);
-        } else {
-          setDetailOffset(0);
-        }
-        return;
-      }
-
-      if (input === "G") {
-        if (panelFocus === "list") {
-          moveIndex(maxIndex);
-        } else {
-          setDetailOffset(maxDetailOffset);
-        }
-        return;
-      }
-
-      if ((key as { pageDown?: boolean }).pageDown) {
-        if (panelFocus === "list") {
-          moveIndex(listPageStep);
-        } else {
-          moveDetail(detailPageStep);
-        }
-        return;
-      }
-
-      if ((key as { pageUp?: boolean }).pageUp) {
-        if (panelFocus === "list") {
-          moveIndex(-listPageStep);
-        } else {
-          moveDetail(-detailPageStep);
-        }
-        return;
-      }
-
-      if (key.downArrow || input === "j") {
-        if (panelFocus === "list") {
-          moveIndex(1);
-        } else {
-          moveDetail(1);
-        }
-        return;
-      }
-
-      if (key.upArrow || input === "k") {
-        if (panelFocus === "list") {
-          moveIndex(-1);
-        } else {
-          moveDetail(-1);
-        }
-      }
-    },
-    { isActive: Boolean(isRawModeSupported) }
-  );
-
-  useEffect(() => {
-    if (!isRawModeSupported) {
-      onExitRequest();
-    }
-  }, [isRawModeSupported, onExitRequest]);
-
-  useEffect(() => {
-    if (!isRawModeSupported || !stdin.isTTY || !stdout.isTTY) {
+    if (!isRawModeSupported || !stdin.isTTY || !stdout.isTTY || !mouseCaptureEnabled) {
       return;
     }
 
@@ -942,105 +1233,156 @@ export function CommentsViewer({
       stdin.off("data", onData);
       stdout.write(disableMouse);
     };
-  }, [isRawModeSupported, stdin, stdout]);
+  }, [isRawModeSupported, stdin, stdout, mouseCaptureEnabled]);
+
+  useInput(
+    (input, key) => {
+      if (input === "q" || key.escape || (key.ctrl && input === "c")) {
+        onExitRequest();
+        return;
+      }
+
+      if (input === "b") {
+        onBackToPrSelection();
+        return;
+      }
+
+      if (input === "m") {
+        setMouseCaptureEnabled((prev) => !prev);
+        return;
+      }
+
+      if (key.tab || input === "\t") {
+        setPanelFocus((prev) => (prev === "list" ? "detail" : "list"));
+        return;
+      }
+
+      if (input === "g") {
+        if (panelFocus === "list") {
+          setActiveIndex(0);
+        } else {
+          setDetailOffset(0);
+        }
+        return;
+      }
+
+      if (input === "G") {
+        if (panelFocus === "list") {
+          setActiveIndex(maxIndex);
+        } else {
+          setDetailOffset(maxDetailOffset);
+        }
+        return;
+      }
+
+      if ((key as { pageDown?: boolean }).pageDown) {
+        if (panelFocus === "list") {
+          moveIndex(listPageStep);
+        } else {
+          moveDetail(detailPageStep);
+        }
+        return;
+      }
+
+      if ((key as { pageUp?: boolean }).pageUp) {
+        if (panelFocus === "list") {
+          moveIndex(-listPageStep);
+        } else {
+          moveDetail(-detailPageStep);
+        }
+        return;
+      }
+
+      if (key.downArrow || input === "j") {
+        if (panelFocus === "list") {
+          moveIndex(1);
+        } else {
+          moveDetail(1);
+        }
+        return;
+      }
+
+      if (key.upArrow || input === "k") {
+        if (panelFocus === "list") {
+          moveIndex(-1);
+        } else {
+          moveDetail(-1);
+        }
+      }
+    },
+    { isActive: Boolean(isRawModeSupported) }
+  );
 
   return (
     <Box flexDirection="column" paddingX={1}>
-      <Text color="green" wrap="wrap">{`ghr  ${data.repo.nameWithOwner}  #${data.pr.number}  ${data.pr.title}`}</Text>
-      <Text dimColor wrap="wrap">{`PR: ${data.pr.url}`}</Text>
-      <Text dimColor wrap="wrap">{`Inference: ${data.prInference}`}</Text>
-      <Text wrap="wrap">{`Counts: discussion ${data.issueComments.length} | inline comments ${data.reviewComments.length} | inline threads ${data.inlineThreads.length} | reviews ${data.reviews.length}`}</Text>
-
-      <Box marginTop={1}>
-        {TAB_ORDER.map((tab) => (
-          <Box key={tab} marginRight={3}>
-            <Text color={activeTab === tab ? "yellow" : "gray"} wrap="wrap">
-              {`${TAB_ORDER.indexOf(tab) + 1}. ${TAB_LABEL[tab]}`}
-            </Text>
-          </Box>
-        ))}
-      </Box>
+      <Text color="green" wrap="wrap">
+        {titleText}
+      </Text>
+      <Text dimColor wrap="wrap">
+        {prText}
+      </Text>
+      <Text dimColor wrap="wrap">
+        {inferenceText}
+      </Text>
+      <Text dimColor wrap="wrap">
+        {selectionText}
+      </Text>
+      <Text dimColor={!refreshError} color={refreshError ? "yellow" : undefined} wrap="wrap">
+        {refreshStatusText}
+      </Text>
+      {refreshError && (
+        <Text color="red" wrap="wrap">
+          {refreshErrorText}
+        </Text>
+      )}
 
       <Box marginTop={1} flexDirection="column" borderStyle="round" paddingX={1} height={listPanelHeight}>
         <Text color={panelFocus === "list" ? "yellow" : "cyan"} wrap="wrap">
-          {`${TAB_LABEL[activeTab]} (${activeRows.length})${panelFocus === "list" ? "  [focus]" : ""}`}
+          {`Comments (${rows.length})${panelFocus === "list" ? "  [focus]" : ""}`}
         </Text>
-        {activeTab === "threads" && (
-          <Text dimColor wrap="wrap">{threadContextText}</Text>
-        )}
-        {activeRows.length === 0 ? (
-          <Text dimColor>No entries.</Text>
+        {rows.length === 0 ? (
+          <Text dimColor wrap="wrap">
+            No comments found.
+          </Text>
         ) : (
-          renderedRows.map((item) => {
-            const { row, selected, headlineLines, sublineLines } = item;
-            return (
-              <Box key={row.key} flexDirection="column">
-                {headlineLines.map((line, lineIdx) => (
-                  <Text
-                    key={`headline-${row.key}-${lineIdx}`}
-                    color={selected ? "yellow" : "white"}
-                    wrap="wrap"
-                  >
-                    {""}
-                    <InlineText spans={line.spans} />
-                  </Text>
-                ))}
-                {sublineLines.map((line, lineIdx) => (
-                  <Text key={`subline-${row.key}-${lineIdx}`} dimColor wrap="wrap">
-                    {""}
-                    <InlineText spans={line.spans} />
-                  </Text>
-                ))}
-              </Box>
-            );
-          })
+          visibleRows.map((item) => (
+            <Text
+              key={`comment-row-${item.row.key}`}
+              wrap="truncate-end"
+            >
+              {""}
+              <InlineText spans={item.spans} />
+            </Text>
+          ))
         )}
       </Box>
 
       <Box flexDirection="column" borderStyle="round" paddingX={1} height={detailPanelHeight}>
         <Text color={panelFocus === "detail" ? "yellow" : "magenta"} wrap="wrap">
-          {`Details: ${TAB_LABEL[activeTab]}${panelFocus === "detail" ? "  [focus]" : ""}`}
+          {`Details${panelFocus === "detail" ? "  [focus]" : ""}`}
         </Text>
-        {activeTab === "threads" && (
-          <Text dimColor wrap="wrap">{threadContextText}</Text>
+        {!selectedRow && (
+          <Text dimColor wrap="wrap">
+            No detail to show.
+          </Text>
         )}
-        {activeRows.length === 0 && <Text dimColor>No detail to show.</Text>}
-
-        {activeTab === "discussion" && selectedDiscussion && (
+        {selectedRow && (
           <Box flexDirection="column">
-            <Text wrap="wrap">{discussionDetailHeadline}</Text>
-            <Text dimColor wrap="wrap">{selectedDiscussion.html_url}</Text>
+            <Text wrap="wrap">
+              {detailTitle}
+            </Text>
+            <Text dimColor wrap="wrap">
+              {detailLocation}
+            </Text>
+            <Text dimColor wrap="wrap">
+              {detailUrl}
+            </Text>
             <Body
               text={detailBodyText}
               startLine={detailOffset}
               maxLines={detailBodyLines}
               wrapWidth={detailWrapWidth}
-            />
-          </Box>
-        )}
-
-        {activeTab === "threads" && selectedThread && (
-          <Box flexDirection="column">
-            <Text wrap="wrap">{threadDetailHeadline}</Text>
-            <Text dimColor wrap="wrap">{selectedThread.root.comment.html_url}</Text>
-            <Body
-              text={detailBodyText}
-              startLine={detailOffset}
-              maxLines={detailBodyLines}
-              wrapWidth={detailWrapWidth}
-            />
-          </Box>
-        )}
-
-        {activeTab === "reviews" && selectedReview && (
-          <Box flexDirection="column">
-            <Text wrap="wrap">{reviewDetailHeadline}</Text>
-            <Text dimColor wrap="wrap">{selectedReview.html_url}</Text>
-            <Body
-              text={detailBodyText}
-              startLine={detailOffset}
-              maxLines={detailBodyLines}
-              wrapWidth={detailWrapWidth}
+              renderOptions={{ commitBaseUrl }}
             />
           </Box>
         )}
