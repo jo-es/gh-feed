@@ -9,8 +9,14 @@ ROOT_DIR="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
 TSX_LOADER="$ROOT_DIR/node_modules/tsx/dist/loader.mjs"
 
 if [[ ! -f "$TSX_LOADER" ]]; then
-  echo "Missing tsx loader at $TSX_LOADER" >&2
-  echo "Run: npm install" >&2
+  echo "Installing gh-reader runtime dependencies..." >&2
+  if ! npm ci --prefix "$ROOT_DIR" --no-audit --no-fund --silent >/dev/null 2>&1; then
+    npm install --prefix "$ROOT_DIR" --no-audit --no-fund --silent >/dev/null 2>&1 || npm install --prefix "$ROOT_DIR"
+  fi
+fi
+
+if [[ ! -f "$TSX_LOADER" ]]; then
+  echo "Missing tsx loader at $TSX_LOADER after dependency install attempt." >&2
   exit 1
 fi
 
