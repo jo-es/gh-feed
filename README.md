@@ -45,6 +45,12 @@ npm link
 gh extension install jo-es/gh-feed
 ```
 
+If the extension is already installed, upgrade it with:
+
+```bash
+gh extension upgrade feed
+```
+
 Run it as:
 
 ```bash
@@ -134,4 +140,4 @@ Detail action row (mouse + keyboard):
 - Recent timestamps show relative time (for example `12min ago`), older items show date+time.
 - Comment bodies render lightweight markdown styling (headings, bullets, links, inline code, emphasis).
 - PR description is included in Discussion.
-- Data auto-refreshes every 10 seconds; if a refresh fails, the last successful snapshot stays visible.
+- Data auto-refreshes every 30 seconds; if a refresh fails, the last successful snapshot stays visible.

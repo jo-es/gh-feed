@@ -23,7 +23,7 @@ Options:
 `;
 
 const CLEAR_TERMINAL = "\u001B[2J\u001B[3J\u001B[H";
-const AUTO_REFRESH_INTERVAL_MS = 10_000;
+const AUTO_REFRESH_INTERVAL_MS = 30_000;
 
 type Screen =
   | "loading-pr-list"
