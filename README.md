@@ -11,6 +11,12 @@ It uses your existing `gh` authentication and calls `gh api` under the hood.
 
 All reads use `--paginate`.
 
+## What it writes
+
+- Top-level PR comment: `repos/<owner>/<repo>/issues/<pr>/comments`
+- Inline reply to inline comment: `repos/<owner>/<repo>/pulls/<pr>/comments/<comment_id>/replies`
+- Reply to non-inline entries (discussion/review summary): posted as a PR discussion comment with a backlink to the target comment
+
 ## Install
 
 ```bash
@@ -68,6 +74,8 @@ PR picker:
 
 Comments view:
 - `j`/`k` or up/down arrows: scroll focused panel
+- `Enter` on `Add your comment here...`: open composer for a top-level comment
+- `r`: reply to selected comment
 - `Tab`: switch focus between top list and bottom detail panel
 - `PgUp`/`PgDn`: page scroll focused panel
 - `g`/`G`: jump to top/bottom of focused panel
@@ -75,11 +83,20 @@ Comments view:
 - `m`: toggle mouse capture (turn off to select/copy text with the terminal mouse)
 - `q`: quit
 
+Compose mode:
+- Type to edit comment text in the bottom panel
+- `Enter`: newline
+- `Ctrl+S`: send
+- `Esc`: cancel
+
 ## Display behavior
 
 - Top panel shows one unified comments list:
+  - `Add your comment here...` row at the top for composing a top-level comment
   - discussion comments
   - inline thread roots with nested inline replies
+  - review summary comments (APPROVED/COMMENTED/etc.)
+- Inline threads linked to a review are nested under that review summary.
 - Inline replies are indented in the top list.
 - The bottom panel shows full markdown-rendered body for the selected entry.
 - Commit hashes in markdown bodies (for example `7b3aeaf`) are rendered as clickable GitHub commit links.

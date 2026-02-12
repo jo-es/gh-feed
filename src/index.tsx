@@ -2,8 +2,8 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { Box, render, Text, useInput, useStdin } from "ink";
 import { CommentsViewer, PrSelector } from "./App.js";
-import { listOpenPrs, loadPrComments } from "./gh.js";
-import type { CliOptions, LoadedPrComments, PrListItem } from "./types.js";
+import { listOpenPrs, loadPrComments, submitPrComment } from "./gh.js";
+import type { CliOptions, LoadedPrComments, PrListItem, SubmitCommentRequest } from "./types.js";
 
 const HELP = `ghr - Read GitHub PR comments in a threaded Ink TUI
 
@@ -265,6 +265,38 @@ function Root({
     [options.repoOverride, repoName]
   );
 
+  const submitComment = useCallback(
+    async (request: SubmitCommentRequest): Promise<void> => {
+      if (!data || selectedPrNumber === null) {
+        throw new Error("No pull request is currently open.");
+      }
+
+      setIsRefreshing(true);
+      try {
+        await submitPrComment({
+          repo: data.repo,
+          prNumber: selectedPrNumber,
+          request
+        });
+
+        const loaded = await loadPrComments({
+          repoOverride: data.repo.nameWithOwner,
+          prNumber: selectedPrNumber
+        });
+        setData(loaded);
+        setRefreshError(null);
+        setLastUpdatedAt(Date.now());
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        setRefreshError(message);
+        throw new Error(message);
+      } finally {
+        setIsRefreshing(false);
+      }
+    },
+    [data, selectedPrNumber]
+  );
+
   const backToPrSelection = useCallback((): void => {
     setScreen("select-pr");
     setData(null);
@@ -378,6 +410,7 @@ function Root({
         openPrCount={openPrs.length}
         onExitRequest={onExitRequest}
         onBackToPrSelection={backToPrSelection}
+        onSubmitComment={submitComment}
         autoRefreshIntervalMs={AUTO_REFRESH_INTERVAL_MS}
         isRefreshing={isRefreshing}
         lastUpdatedAt={lastUpdatedAt}

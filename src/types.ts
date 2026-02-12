@@ -22,7 +22,23 @@ export interface ReviewComment {
   path: string | null;
   line: number | null;
   original_line: number | null;
+  pull_request_review_id?: number | null;
   in_reply_to_id?: number | null;
+}
+
+export type CommentTargetKind = "discussion" | "inline" | "review";
+
+export interface SubmitCommentTarget {
+  kind: CommentTargetKind;
+  id: number;
+  author: string;
+  htmlUrl: string;
+}
+
+export interface SubmitCommentRequest {
+  mode: "top-level" | "reply";
+  body: string;
+  target?: SubmitCommentTarget;
 }
 
 export interface PullRequestReview {

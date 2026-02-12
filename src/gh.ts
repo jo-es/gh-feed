@@ -10,7 +10,8 @@ import type {
   PrListItem,
   PullRequestReview,
   RepoIdentity,
-  ReviewComment
+  ReviewComment,
+  SubmitCommentRequest
 } from "./types.js";
 
 const execFileAsync = promisify(execFile);
@@ -273,17 +274,31 @@ function normalizeReviewComments(input: ReviewComment[]): ReviewComment[] {
   });
 }
 
-export async function loadPrComments(options: CliOptions): Promise<LoadedPrComments> {
-  const repo = await resolveRepo(options.repoOverride);
-  const { pr, inference } = await resolvePr({
-    ...options,
-    repoOverride: options.repoOverride ?? repo.nameWithOwner
+function normalizeReviews(input: PullRequestReview[]): PullRequestReview[] {
+  return [...input].sort((a, b) => {
+    const aTime = a.submitted_at ? new Date(a.submitted_at).getTime() : 0;
+    const bTime = b.submitted_at ? new Date(b.submitted_at).getTime() : 0;
+    return bTime - aTime;
   });
+}
 
-  const [issueResource, issueCommentsRaw, reviewCommentsRaw] = await Promise.all([
+export async function loadPrComments(options: CliOptions): Promise<LoadedPrComments> {
+  const repoPromise = resolveRepo(options.repoOverride);
+  const prResolutionPromise = options.repoOverride
+    ? resolvePr(options)
+    : repoPromise.then((repo) =>
+        resolvePr({
+          ...options,
+          repoOverride: repo.nameWithOwner
+        })
+      );
+  const [repo, { pr, inference }] = await Promise.all([repoPromise, prResolutionPromise]);
+
+  const [issueResource, issueCommentsRaw, reviewCommentsRaw, reviewsRaw] = await Promise.all([
     ghJson<IssueResource>(["api", `repos/${repo.owner}/${repo.repo}/issues/${pr.number}`]),
     ghPaginatedArray<IssueComment>(`repos/${repo.owner}/${repo.repo}/issues/${pr.number}/comments`),
-    ghPaginatedArray<ReviewComment>(`repos/${repo.owner}/${repo.repo}/pulls/${pr.number}/comments`)
+    ghPaginatedArray<ReviewComment>(`repos/${repo.owner}/${repo.repo}/pulls/${pr.number}/comments`),
+    ghPaginatedArray<PullRequestReview>(`repos/${repo.owner}/${repo.repo}/pulls/${pr.number}/reviews`)
   ]);
 
   const prDescription: IssueComment = {
@@ -301,7 +316,7 @@ export async function loadPrComments(options: CliOptions): Promise<LoadedPrComme
     ...issueCommentsRaw.map((comment) => ({ ...comment, is_pr_description: false }))
   ]);
   const reviewComments = normalizeReviewComments(reviewCommentsRaw);
-  const reviews: PullRequestReview[] = [];
+  const reviews = normalizeReviews(reviewsRaw);
   const inlineThreads = buildInlineThreads(reviewComments);
 
   return {
@@ -313,6 +328,50 @@ export async function loadPrComments(options: CliOptions): Promise<LoadedPrComme
     inlineThreads,
     reviews
   };
+}
+
+function buildReplyFallbackBody(request: SubmitCommentRequest): string {
+  const body = request.body.trim();
+  if (request.mode !== "reply" || !request.target) {
+    return body;
+  }
+
+  const author = request.target.author ? ` @${request.target.author}` : "";
+  return `_Replying to${author}: ${request.target.htmlUrl}_\n\n${body}`;
+}
+
+export async function submitPrComment(options: {
+  repo: RepoIdentity;
+  prNumber: number;
+  request: SubmitCommentRequest;
+}): Promise<void> {
+  const body = options.request.body.trim();
+  if (!body) {
+    throw new Error("Comment body cannot be empty.");
+  }
+
+  const { repo, prNumber, request } = options;
+  if (request.mode === "reply" && request.target?.kind === "inline") {
+    await run("gh", [
+      "api",
+      "-X",
+      "POST",
+      `repos/${repo.owner}/${repo.repo}/pulls/${prNumber}/comments/${request.target.id}/replies`,
+      "-f",
+      `body=${body}`
+    ]);
+    return;
+  }
+
+  const finalBody = buildReplyFallbackBody(request);
+  await run("gh", [
+    "api",
+    "-X",
+    "POST",
+    `repos/${repo.owner}/${repo.repo}/issues/${prNumber}/comments`,
+    "-f",
+    `body=${finalBody}`
+  ]);
 }
 
 export async function listOpenPrs(options: CliOptions): Promise<{
