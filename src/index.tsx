@@ -5,13 +5,13 @@ import { CommentsViewer, PrSelector } from "./App.js";
 import { listOpenPrs, loadPrComments, submitPrComment } from "./gh.js";
 import type { CliOptions, LoadedPrComments, PrListItem, SubmitCommentRequest } from "./types.js";
 
-const HELP = `ghr - Read GitHub PR comments in a threaded Ink TUI
+const HELP = `gh-feed - Read GitHub PR comments in a threaded Ink TUI
 
 Usage:
-  ghr
-  ghr --pr 123
-  ghr --repo owner/repo
-  ghr --repo owner/repo --pr 123
+  gh feed
+  gh feed --pr 123
+  gh feed --repo owner/repo
+  gh feed --repo owner/repo --pr 123
 
 Options:
   --pr <number>      Initial PR selection

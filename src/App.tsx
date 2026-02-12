@@ -1042,7 +1042,7 @@ export function PrSelector({
   const terminalCols = stdout.columns || 80;
   const listWrapWidth = Math.max(24, terminalCols - 8);
   const appWrapWidth = Math.max(16, terminalCols - 2);
-  const titleText = `ghr  ${repoName}`;
+  const titleText = `gh-feed  ${repoName}`;
   const statusText = `Open PRs: ${prs.length}${isRefreshing ? " | refreshing..." : ""}`;
   const refreshEvery = autoRefreshIntervalMs % 1000 === 0
     ? `${autoRefreshIntervalMs / 1000}s`
@@ -1411,7 +1411,7 @@ export function CommentsViewer({
   const refreshEvery = autoRefreshIntervalMs % 1000 === 0
     ? `${autoRefreshIntervalMs / 1000}s`
     : `${(autoRefreshIntervalMs / 1000).toFixed(1)}s`;
-  const titleText = `ghr  ${data.repo.nameWithOwner}  #${data.pr.number}  ${data.pr.title}`;
+  const titleText = `gh-feed  ${data.repo.nameWithOwner}  #${data.pr.number}  ${data.pr.title}`;
   const prText = `PR: ${data.pr.url}`;
   const inferenceText = `Inference: ${data.prInference}`;
   const mouseCaptureStatus = !mouseCaptureEnabled

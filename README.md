@@ -1,4 +1,4 @@
-# gh-reader (`ghr`)
+# gh-feed (`gh feed`)
 
 Ink + React TUI for reading all GitHub pull request comments, including inline sub-threads.
 
@@ -27,26 +27,26 @@ npm link
 ## Install as `gh` extension
 
 ```bash
-gh extension install jo-es/gh-reader
+gh extension install jo-es/gh-feed
 ```
 
 Run it as:
 
 ```bash
-gh reader
+gh feed
 ```
 
 ## Run
 
 ```bash
-ghr
+gh feed
 ```
 
 Or use the local bin/script without linking:
 
 ```bash
-./bin/ghr
-npm run ghr
+./bin/gh-feed
+npm run gh-feed
 ```
 
 Options:
@@ -56,7 +56,7 @@ Options:
 
 ## Startup flow
 
-By default `ghr` now starts on an open-PR selection screen:
+By default `gh-feed` now starts on an open-PR selection screen:
 
 1. `gh repo view --json nameWithOwner` (fallback: parse `git remote origin`)
 2. list open PRs (`gh pr list --state open`)
