@@ -39,6 +39,12 @@ gh feed
 ## Run
 
 ```bash
+gh-feed
+```
+
+Or run through the GitHub CLI extension entrypoint:
+
+```bash
 gh feed
 ```
 

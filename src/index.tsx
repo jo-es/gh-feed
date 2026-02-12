@@ -8,6 +8,9 @@ import type { CliOptions, LoadedPrComments, PrListItem, SubmitCommentRequest } f
 const HELP = `gh-feed - Read GitHub PR comments in a threaded Ink TUI
 
 Usage:
+  gh-feed
+  gh-feed --pr 123
+  gh-feed --repo owner/repo
   gh feed
   gh feed --pr 123
   gh feed --repo owner/repo
