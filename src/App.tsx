@@ -1521,7 +1521,7 @@ export function CommentsViewer({
     });
   }, [listRows, maxIndex]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     selectedRowKeyRef.current = activeListRow.key;
   }, [activeListRow.key]);
 
@@ -1867,8 +1867,15 @@ export function CommentsViewer({
   }, [maxDetailOffset]);
 
   const moveIndex = useCallback((delta: number): void => {
-    setActiveIndex((prev) => clamp(prev + delta, 0, maxIndex));
-  }, [maxIndex]);
+    setActiveIndex((prev) => {
+      const next = clamp(prev + delta, 0, maxIndex);
+      const row = listRows[next];
+      if (row) {
+        selectedRowKeyRef.current = row.key;
+      }
+      return next;
+    });
+  }, [listRows, maxIndex]);
 
   const moveDetail = useCallback((delta: number): void => {
     setDetailOffset((prev) => clamp(prev + delta, 0, maxDetailOffset));
@@ -1918,12 +1925,13 @@ export function CommentsViewer({
         if (event.kind === "M" && event.code === 0) {
           const clickedPanel = panelAtMouseRow(event.y);
           if (clickedPanel === "list") {
-            if (
-              event.y === listHeaderRow &&
-              event.x >= listHeaderCopilotLayout.startX &&
-              event.x <= listHeaderCopilotLayout.endX
-            ) {
-              void requestCopilotReviewForCurrentPr();
+            if (event.y === listHeaderRow) {
+              if (
+                event.x >= listHeaderCopilotLayout.startX &&
+                event.x <= listHeaderCopilotLayout.endX
+              ) {
+                void requestCopilotReviewForCurrentPr();
+              }
               continue;
             }
             panelFocusRef.current = "list";
@@ -1931,6 +1939,10 @@ export function CommentsViewer({
             const offset = event.y - listFirstItemRow;
             if (offset >= 0 && offset < visibleRows.length) {
               const next = clamp(listStart + offset, 0, maxIndex);
+              const row = listRows[next];
+              if (row) {
+                selectedRowKeyRef.current = row.key;
+              }
               setActiveIndex(next);
             }
             continue;
@@ -2103,6 +2115,10 @@ export function CommentsViewer({
 
       if (input === "g") {
         if (panelFocus === "list") {
+          const row = listRows[0];
+          if (row) {
+            selectedRowKeyRef.current = row.key;
+          }
           setActiveIndex(0);
         } else {
           setDetailOffset(0);
@@ -2112,6 +2128,10 @@ export function CommentsViewer({
 
       if (input === "G") {
         if (panelFocus === "list") {
+          const row = listRows[maxIndex];
+          if (row) {
+            selectedRowKeyRef.current = row.key;
+          }
           setActiveIndex(maxIndex);
         } else {
           setDetailOffset(maxDetailOffset);
