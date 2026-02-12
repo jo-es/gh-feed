@@ -89,6 +89,7 @@ Comments view:
 - `j`/`k` or up/down arrows: scroll focused panel
 - `Enter` on `Press Enter to add a new comment...`: open composer for a top-level comment
 - `r`: reply to selected comment
+- `c`: request review from Copilot Pull Request Reviewer
 - `Tab`: switch focus between top list and bottom detail panel
 - `PgUp`/`PgDn`: page scroll focused panel
 - `g`/`G`: jump to top/bottom of focused panel

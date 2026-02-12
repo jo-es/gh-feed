@@ -50,6 +50,10 @@ interface ReviewTimelineGraphqlNode {
   requestedReviewer?: { __typename?: string; login?: string | null } | null;
 }
 
+interface RequestedReviewersResponse {
+  users?: Array<{ login?: string | null }>;
+}
+
 async function run(
   bin: string,
   args: string[],
@@ -448,6 +452,78 @@ function buildAiReviewEvents(options: {
   }
 
   return normalizeAiReviewEvents(events);
+}
+
+async function ensureCopilotReviewExtension(): Promise<void> {
+  const helpOutput = await run("gh", ["copilot-review", "--help"], { allowFailure: true });
+  if (helpOutput) {
+    return;
+  }
+
+  await run("gh", ["extension", "install", "ChrisCarini/gh-copilot-review"]);
+}
+
+function hasCopilotReviewer(response: RequestedReviewersResponse): boolean {
+  const users = response.users || [];
+  return users.some((user) => {
+    const login = (user.login || "").toLowerCase();
+    return login.includes("copilot-pull-request-reviewer") || login.includes("copilot");
+  });
+}
+
+async function isCopilotRequested(options: {
+  repo: RepoIdentity;
+  prNumber: number;
+}): Promise<boolean> {
+  const response = await ghJson<RequestedReviewersResponse>([
+    "api",
+    `repos/${options.repo.owner}/${options.repo.repo}/pulls/${options.prNumber}/requested_reviewers`
+  ]);
+  return hasCopilotReviewer(response);
+}
+
+export async function requestCopilotPrReview(options: {
+  repo: RepoIdentity;
+  prNumber: number;
+}): Promise<void> {
+  await ensureCopilotReviewExtension();
+
+  const prUrl = `https://github.com/${options.repo.nameWithOwner}/pull/${options.prNumber}`;
+  let extensionError: string | null = null;
+  try {
+    await run("gh", ["copilot-review", prUrl]);
+  } catch (error) {
+    extensionError = error instanceof Error ? error.message : String(error);
+  }
+
+  if (await isCopilotRequested(options)) {
+    return;
+  }
+
+  await run(
+    "gh",
+    [
+      "api",
+      "--method",
+      "POST",
+      `repos/${options.repo.owner}/${options.repo.repo}/pulls/${options.prNumber}/requested_reviewers`,
+      "-f",
+      "reviewers[]=copilot-pull-request-reviewer[bot]"
+    ],
+    { allowFailure: true }
+  );
+
+  if (await isCopilotRequested(options)) {
+    return;
+  }
+
+  if (extensionError) {
+    throw new Error(
+      `Could not request Copilot review via extension or REST API. Extension error: ${extensionError}`
+    );
+  }
+
+  throw new Error("Could not verify Copilot as a requested reviewer after request attempt.");
 }
 
 export async function loadPrComments(options: CliOptions): Promise<LoadedPrComments> {

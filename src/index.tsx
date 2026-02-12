@@ -2,7 +2,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Box, render, Text, useInput, useStdin } from "ink";
 import { CommentsViewer, PrSelector } from "./App.js";
-import { listOpenPrs, loadPrComments, submitPrComment } from "./gh.js";
+import { listOpenPrs, loadPrComments, requestCopilotPrReview, submitPrComment } from "./gh.js";
 import type { CliOptions, LoadedPrComments, PrListItem, SubmitCommentRequest } from "./types.js";
 
 const HELP = `gh-feed - Read GitHub PR comments in a threaded Ink TUI
@@ -311,6 +311,43 @@ function Root({
     [data, selectedPrNumber]
   );
 
+  const requestCopilotReview = useCallback(async (): Promise<void> => {
+    if (!data || selectedPrNumber === null) {
+      throw new Error("No pull request is currently open.");
+    }
+
+    submitInFlightRef.current = true;
+    const refreshVersion = ++commentRefreshVersionRef.current;
+    setIsRefreshing(true);
+    try {
+      await requestCopilotPrReview({
+        repo: data.repo,
+        prNumber: selectedPrNumber
+      });
+
+      const loaded = await loadPrComments({
+        repoOverride: data.repo.nameWithOwner,
+        prNumber: selectedPrNumber
+      });
+      if (refreshVersion === commentRefreshVersionRef.current) {
+        setData(loaded);
+        setRefreshError(null);
+        setLastUpdatedAt(Date.now());
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (refreshVersion === commentRefreshVersionRef.current) {
+        setRefreshError(message);
+      }
+      throw new Error(message);
+    } finally {
+      submitInFlightRef.current = false;
+      if (refreshVersion === commentRefreshVersionRef.current) {
+        setIsRefreshing(false);
+      }
+    }
+  }, [data, selectedPrNumber]);
+
   const backToPrSelection = useCallback((): void => {
     setScreen("select-pr");
     setData(null);
@@ -451,6 +488,7 @@ function Root({
         onExitRequest={onExitRequest}
         onBackToPrSelection={backToPrSelection}
         onSubmitComment={submitComment}
+        onRequestCopilotReview={requestCopilotReview}
         autoRefreshIntervalMs={AUTO_REFRESH_INTERVAL_MS}
         isRefreshing={isRefreshing}
         lastUpdatedAt={lastUpdatedAt}

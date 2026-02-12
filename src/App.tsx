@@ -1340,6 +1340,7 @@ export function CommentsViewer({
   onExitRequest,
   onBackToPrSelection,
   onSubmitComment,
+  onRequestCopilotReview,
   autoRefreshIntervalMs,
   isRefreshing,
   lastUpdatedAt,
@@ -1350,6 +1351,7 @@ export function CommentsViewer({
   onExitRequest: () => void;
   onBackToPrSelection: () => void;
   onSubmitComment: (request: SubmitCommentRequest) => Promise<void>;
+  onRequestCopilotReview: () => Promise<void>;
   autoRefreshIntervalMs: number;
   isRefreshing: boolean;
   lastUpdatedAt: number | null;
@@ -1367,7 +1369,9 @@ export function CommentsViewer({
   const [composerMode, setComposerMode] = useState<ComposerMode>(null);
   const [composerBody, setComposerBody] = useState("");
   const [composerError, setComposerError] = useState<string | null>(null);
+  const [detailActionError, setDetailActionError] = useState<string | null>(null);
   const [isSubmittingComment, setIsSubmittingComment] = useState(false);
+  const [isRequestingCopilot, setIsRequestingCopilot] = useState(false);
   const panelFocusRef = useRef<PanelFocus>("list");
   const pendingComposerRef = useRef<ComposerMode>(null);
   const submitComposerRef = useRef<() => Promise<void>>(async () => undefined);
@@ -1385,6 +1389,7 @@ export function CommentsViewer({
     setComposerMode(nextComposer);
     setComposerBody("");
     setComposerError(null);
+    setDetailActionError(null);
     setDetailOffset(0);
     panelFocusRef.current = "detail";
     setPanelFocus("detail");
@@ -1405,6 +1410,7 @@ export function CommentsViewer({
     setComposerMode(nextComposer);
     setComposerBody("");
     setComposerError(null);
+    setDetailActionError(null);
     setDetailOffset(0);
     panelFocusRef.current = "detail";
     setPanelFocus("detail");
@@ -1419,6 +1425,7 @@ export function CommentsViewer({
     pendingComposerRef.current = null;
     setComposerBody("");
     setComposerError(null);
+    setDetailActionError(null);
     setDetailOffset(0);
     panelFocusRef.current = "list";
     setPanelFocus("list");
@@ -1483,12 +1490,30 @@ export function CommentsViewer({
     openReplyComposer(replyableSelectedRow);
   }, [openReplyComposer, replyableSelectedRow]);
 
+  const requestCopilotReviewForCurrentPr = useCallback(async (): Promise<void> => {
+    if (composerMode || isRequestingCopilot) {
+      return;
+    }
+
+    setIsRequestingCopilot(true);
+    setDetailActionError(null);
+    try {
+      await onRequestCopilotReview();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setDetailActionError(`Failed to request Copilot review: ${message}`);
+    } finally {
+      setIsRequestingCopilot(false);
+    }
+  }, [composerMode, isRequestingCopilot, onRequestCopilotReview]);
+
   useEffect(() => {
     setActiveIndex((prev) => clamp(prev, 0, maxIndex));
   }, [maxIndex]);
 
   useEffect(() => {
     setDetailOffset(0);
+    setDetailActionError(null);
   }, [
     safeActiveIndex,
     activeListRow.key,
@@ -1536,7 +1561,7 @@ export function CommentsViewer({
   const refreshStatusText = `Auto refresh: every ${refreshEvery} | last update ${fmtTimeOfDay(lastUpdatedAt)}${isRefreshing ? " | refreshing..." : ""}`;
   const refreshErrorText = refreshError ? `Last refresh failed: ${refreshError}` : "";
   const helpText = isRawModeSupported
-    ? "Keys: j/k move, Enter compose, r reply, Tab focus, b PR list, m mouse capture, q quit"
+    ? "Keys: j/k move, Enter compose, r reply, c Copilot review, Tab focus, b PR list, m mouse capture, q quit"
     : "Non-interactive terminal detected: rendered once and exiting.";
   const topHeaderLines =
     countWrappedPlainLines(titleText, appWrapWidth) +
@@ -1563,7 +1588,7 @@ export function CommentsViewer({
     Math.max(0, listRows.length - listWindow)
   );
 
-  type DetailActionId = "compose" | "reply" | "send" | "cancel";
+  type DetailActionId = "compose" | "reply" | "send" | "cancel" | "copilot-review";
   interface DetailActionButton {
     id: DetailActionId;
     label: string;
@@ -1588,12 +1613,21 @@ export function CommentsViewer({
       ];
     }
 
+    const buttons: DetailActionButton[] = [];
     if (replyableSelectedRow) {
-      return [{ id: "reply", label: "[Reply]", color: "cyan" }];
+      buttons.push({ id: "reply", label: "[Reply]", color: "cyan" });
+    } else {
+      buttons.push({ id: "compose", label: "[Compose]", color: "cyan" });
     }
 
-    return [{ id: "compose", label: "[Compose]", color: "cyan" }];
-  }, [composerMode, isSubmittingComment, replyableSelectedRow]);
+    buttons.push({
+      id: "copilot-review",
+      label: isRequestingCopilot ? "[Requesting Copilot...]" : "[Copilot Review]",
+      color: isRequestingCopilot ? "gray" : "magenta",
+      dim: isRequestingCopilot
+    });
+    return buttons;
+  }, [composerMode, isRequestingCopilot, isSubmittingComment, replyableSelectedRow]);
 
   const detailActionSpans = useMemo(() => {
     const spans: InlineSpan[] = [];
@@ -1612,16 +1646,18 @@ export function CommentsViewer({
 
     if (composerMode) {
       spans.push({ text: "  Ctrl+S send | Esc cancel", dim: true });
+    } else if (isRequestingCopilot) {
+      spans.push({ text: "  Requesting Copilot review...", dim: true });
     } else if (replyableSelectedRow) {
-      spans.push({ text: "  Press r to reply", dim: true });
+      spans.push({ text: "  Press r to reply | c Copilot review", dim: true });
     } else if (selectedRow && selectedRow.kind === "system") {
-      spans.push({ text: "  System event (read-only)", dim: true });
+      spans.push({ text: "  System event (read-only) | c Copilot review", dim: true });
     } else {
-      spans.push({ text: "  Press Enter to add a new comment...", dim: true });
+      spans.push({ text: "  Press Enter to add a new comment... | c Copilot review", dim: true });
     }
 
     return spans;
-  }, [composerMode, detailActionButtons, replyableSelectedRow, selectedRow]);
+  }, [composerMode, detailActionButtons, isRequestingCopilot, replyableSelectedRow, selectedRow]);
 
   const detailActionColumnStart = 4;
   const detailActionLayouts = useMemo<DetailActionLayout[]>(() => {
@@ -1712,8 +1748,13 @@ export function CommentsViewer({
 
     if (action === "send") {
       void submitComposerRef.current();
+      return;
     }
-  }, [closeComposer, openTopLevelComposer, startReplyForSelection]);
+
+    if (action === "copilot-review") {
+      void requestCopilotReviewForCurrentPr();
+    }
+  }, [closeComposer, openTopLevelComposer, requestCopilotReviewForCurrentPr, startReplyForSelection]);
 
   let detailTitle = "";
   let detailLocation = "";
@@ -1753,6 +1794,7 @@ export function CommentsViewer({
   const detailRenderOptions = composerMode ? undefined : { commitBaseUrl };
   const showPlaceholderBody = !composerMode && !selectedRow;
   const showPlainBody = showPlaceholderBody || Boolean(composerMode);
+  const activeDetailError = composerMode ? composerError : detailActionError;
   // Detail panel interior contains:
   // 1) "Details" header row
   // 2) content block (title/location/url/error/body)
@@ -1765,8 +1807,8 @@ export function CommentsViewer({
   if (detailUrl) {
     detailLinesAboveBody += countWrappedPlainLines(detailUrl, detailWrapWidth);
   }
-  if (composerError) {
-    detailLinesAboveBody += countWrappedPlainLines(composerError, detailWrapWidth);
+  if (activeDetailError) {
+    detailLinesAboveBody += countWrappedPlainLines(activeDetailError, detailWrapWidth);
   }
 
   const detailBodyLines = Math.max(1, detailNonActionLines - detailLinesAboveBody);
@@ -1984,6 +2026,11 @@ export function CommentsViewer({
         return;
       }
 
+      if (input === "c") {
+        void requestCopilotReviewForCurrentPr();
+        return;
+      }
+
       if (key.return && activeListRow.kind === "add-comment") {
         openTopLevelComposer();
         return;
@@ -2110,9 +2157,9 @@ export function CommentsViewer({
               {detailUrl}
             </Text>
           )}
-          {composerError && (
+          {activeDetailError && (
             <Text color="red" wrap="wrap">
-              {composerError}
+              {activeDetailError}
             </Text>
           )}
           {showPlainBody ? (
