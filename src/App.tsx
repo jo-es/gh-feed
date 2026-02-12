@@ -4,11 +4,18 @@ import type {
   InlineCommentNode,
   IssueComment,
   LoadedPrComments,
-  PrListItem
+  PullRequestReview,
+  PrListItem,
+  SubmitCommentRequest
 } from "./types.js";
 
 type PanelFocus = "list" | "detail";
 const HTML_TAG_RE = /<\/?[a-z][a-z0-9-]*(?:\s[^>]*?)?\/?>/gi;
+const ADD_COMMENT_ROW: AddCommentRow = {
+  key: "add-comment",
+  kind: "add-comment",
+  label: "Press Enter to add a new comment..."
+};
 
 interface InlineSpan {
   text: string;
@@ -39,6 +46,7 @@ interface MarkdownRenderOptions {
 
 interface UnifiedCommentRow {
   key: string;
+  commentId: number;
   depth: number;
   subline: string;
   body: string;
@@ -46,8 +54,30 @@ interface UnifiedCommentRow {
   createdAt: string;
   author: string;
   location: string;
-  kind: "discussion" | "inline";
+  kind: "discussion" | "inline" | "review";
 }
+
+interface AddCommentRow {
+  key: "add-comment";
+  kind: "add-comment";
+  label: string;
+}
+
+type CommentListRow = AddCommentRow | UnifiedCommentRow;
+
+type ComposerMode =
+  | null
+  | { mode: "top-level" }
+  | {
+      mode: "reply";
+      target: {
+        kind: UnifiedCommentRow["kind"];
+        id: number;
+        author: string;
+        htmlUrl: string;
+        location: string;
+      };
+    };
 
 interface SelectorRow {
   key: string;
@@ -272,6 +302,39 @@ function parseMouseSequences(chunk: string): MouseSequence[] {
   }
 
   return events;
+}
+
+function normalizeSingleLineLabel(value: string): string {
+  const cleaned = value
+    .replace(/\r\n/g, "\n")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/[\x00-\x1f\x7f]/g, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  return cleaned || "unknown";
+}
+
+function normalizeComposeNewlines(value: string): string {
+  return value.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+}
+
+function sanitizeComposeInput(input: string): string {
+  if (!input) {
+    return "";
+  }
+
+  let output = normalizeComposeNewlines(input);
+  // OSC sequences
+  output = output.replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, "");
+  // CSI sequences
+  output = output.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "");
+  // Two-byte escapes
+  output = output.replace(/\u001b[@-_]/g, "");
+  // Orphaned mouse chunks where ESC was split/lost
+  output = output.replace(/\[<\d+;\d+;\d+[mM]/g, "");
+  // Remaining controls except tab/newline
+  output = output.replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]/g, "");
+  return output;
 }
 
 function appendTextWithCommitLinks(
@@ -626,13 +689,35 @@ function countWrappedMarkdownLines(
 
 function countWrappedPlainLines(text: string, wrapWidth: number): number {
   const safeWidth = Math.max(1, wrapWidth);
-  return (text || "").split(/\r?\n/).reduce((sum, line) => {
+  return normalizeComposeNewlines(text || "").split("\n").reduce((sum, line) => {
     if (line.length === 0) {
       return sum + 1;
     }
 
     return sum + Math.max(1, Math.ceil(line.length / safeWidth));
   }, 0);
+}
+
+function wrapPlainLines(text: string, wrapWidth: number): string[] {
+  const safeWidth = Math.max(1, wrapWidth);
+  const source = normalizeComposeNewlines(text || "").split("\n");
+  const output: string[] = [];
+
+  for (const raw of source) {
+    if (raw.length === 0) {
+      output.push("");
+      continue;
+    }
+
+    let remaining = raw;
+    while (remaining.length > safeWidth) {
+      output.push(remaining.slice(0, safeWidth));
+      remaining = remaining.slice(safeWidth);
+    }
+    output.push(remaining);
+  }
+
+  return output.length > 0 ? output : [""];
 }
 
 function formatCommentListLine({
@@ -733,6 +818,72 @@ function Body({
   );
 }
 
+function PlainBody({
+  text,
+  maxLines,
+  startLine = 0,
+  wrapWidth,
+  dim = false,
+  leftPad = 1
+}: {
+  text: string;
+  maxLines?: number;
+  startLine?: number;
+  wrapWidth: number;
+  dim?: boolean;
+  leftPad?: number;
+}): JSX.Element {
+  const pad = Math.max(0, leftPad);
+  const contentWidth = Math.max(1, wrapWidth - pad);
+  const wrapped = wrapPlainLines(text, contentWidth);
+  const hasWrapped = wrapped.length > 0;
+  const safeStart = hasWrapped ? clamp(startLine, 0, wrapped.length - 1) : 0;
+
+  let clipped: string[];
+  let hidden = 0;
+  let padLines = 0;
+  if (typeof maxLines === "number") {
+    const safeMax = Math.max(1, maxLines);
+    const hiddenCandidate = Math.max(0, wrapped.length - (safeStart + safeMax));
+    // Always render at least one content row. If we only have one row budget,
+    // skip the "... more lines" indicator instead of hiding all content.
+    const showHiddenIndicator = hiddenCandidate > 0 && safeMax > 1;
+    const contentLimit = showHiddenIndicator ? safeMax - 1 : safeMax;
+    clipped = wrapped.slice(safeStart, safeStart + contentLimit);
+    hidden = showHiddenIndicator ? hiddenCandidate : 0;
+    padLines = safeMax - clipped.length - (hidden > 0 ? 1 : 0);
+  } else {
+    clipped = wrapped.slice(safeStart);
+    hidden = Math.max(0, wrapped.length - (safeStart + clipped.length));
+  }
+
+  return (
+    <Box flexDirection="column">
+      {clipped.map((line, idx) => {
+        const safeLine = line.length > 0 ? line : " ";
+        const rendered = safeLine.slice(0, contentWidth).padEnd(contentWidth, " ");
+        return (
+          <Text key={`plain-body-${idx}`} dimColor={dim} wrap="truncate-end">
+            {`${" ".repeat(pad)}${rendered}`}
+          </Text>
+        );
+      })}
+      {hidden > 0 && (
+        <Text dimColor wrap="truncate-end">
+          {`${" ".repeat(pad)}... (${hidden} more line${hidden === 1 ? "" : "s"})`
+            .slice(0, wrapWidth)
+            .padEnd(wrapWidth, " ")}
+        </Text>
+      )}
+      {Array.from({ length: Math.max(0, padLines) }).map((_, idx) => (
+        <Text key={`plain-body-pad-${idx}`} wrap="truncate-end">
+          {" ".repeat(Math.max(1, wrapWidth))}
+        </Text>
+      ))}
+    </Box>
+  );
+}
+
 function latestTimestamp(node: InlineCommentNode): number {
   let latest = toTimestamp(node.comment.created_at);
   for (const child of node.children) {
@@ -744,6 +895,7 @@ function latestTimestamp(node: InlineCommentNode): number {
 function discussionRow(comment: IssueComment): UnifiedCommentRow {
   return {
     key: `discussion-${comment.id}`,
+    commentId: comment.id,
     depth: 0,
     subline: previewBody(comment.body),
     body: comment.body || "(no body)",
@@ -758,6 +910,7 @@ function discussionRow(comment: IssueComment): UnifiedCommentRow {
 function inlineRows(node: InlineCommentNode, depth: number): UnifiedCommentRow[] {
   const row: UnifiedCommentRow = {
     key: `inline-${node.comment.id}`,
+    commentId: node.comment.id,
     depth,
     subline: previewBody(node.comment.body),
     body: node.comment.body || "(no body)",
@@ -772,8 +925,30 @@ function inlineRows(node: InlineCommentNode, depth: number): UnifiedCommentRow[]
   return [row, ...children];
 }
 
+function reviewRow(review: PullRequestReview): UnifiedCommentRow {
+  const submittedAt = review.submitted_at || "";
+  return {
+    key: `review-${review.id}`,
+    commentId: review.id,
+    depth: 0,
+    subline: previewBody(review.body || "(no body)"),
+    body: review.body || "(no body)",
+    htmlUrl: review.html_url,
+    createdAt: submittedAt,
+    author: author(review.user?.login),
+    location: `review ${review.state.toLowerCase()}`,
+    kind: "review"
+  };
+}
+
 function buildUnifiedRows(data: LoadedPrComments): UnifiedCommentRow[] {
   const grouped: Array<{ sort: number; rows: UnifiedCommentRow[] }> = [];
+  const reviewsById = new Map<number, PullRequestReview>();
+  const inlineThreadsByReviewId = new Map<number, InlineCommentNode[]>();
+
+  for (const review of data.reviews) {
+    reviewsById.set(review.id, review);
+  }
 
   for (const comment of data.issueComments) {
     grouped.push({
@@ -783,9 +958,32 @@ function buildUnifiedRows(data: LoadedPrComments): UnifiedCommentRow[] {
   }
 
   for (const thread of data.inlineThreads) {
+    const reviewId = thread.root.comment.pull_request_review_id ?? null;
+    if (reviewId && reviewsById.has(reviewId)) {
+      const existing = inlineThreadsByReviewId.get(reviewId) || [];
+      existing.push(thread.root);
+      inlineThreadsByReviewId.set(reviewId, existing);
+      continue;
+    }
+
     grouped.push({
       sort: latestTimestamp(thread.root),
       rows: inlineRows(thread.root, 0)
+    });
+  }
+
+  for (const review of data.reviews) {
+    const attachedInlineRoots = inlineThreadsByReviewId.get(review.id) || [];
+    attachedInlineRoots.sort((a, b) => latestTimestamp(a) - latestTimestamp(b));
+    const nestedInlineRows = attachedInlineRoots.flatMap((root) => inlineRows(root, 1));
+    const groupSort = attachedInlineRoots.reduce(
+      (latest, root) => Math.max(latest, latestTimestamp(root)),
+      toTimestamp(review.submitted_at)
+    );
+
+    grouped.push({
+      sort: groupSort,
+      rows: [reviewRow(review), ...nestedInlineRows]
     });
   }
 
@@ -1025,6 +1223,7 @@ export function CommentsViewer({
   openPrCount,
   onExitRequest,
   onBackToPrSelection,
+  onSubmitComment,
   autoRefreshIntervalMs,
   isRefreshing,
   lastUpdatedAt,
@@ -1034,6 +1233,7 @@ export function CommentsViewer({
   openPrCount: number;
   onExitRequest: () => void;
   onBackToPrSelection: () => void;
+  onSubmitComment: (request: SubmitCommentRequest) => Promise<void>;
   autoRefreshIntervalMs: number;
   isRefreshing: boolean;
   lastUpdatedAt: number | null;
@@ -1042,15 +1242,128 @@ export function CommentsViewer({
   const { isRawModeSupported, stdin } = useStdin();
   const { stdout } = useStdout();
   const rows = useMemo(() => buildUnifiedRows(data), [data]);
+  const listRows = useMemo<CommentListRow[]>(() => [...rows, ADD_COMMENT_ROW], [rows]);
   const [panelFocus, setPanelFocus] = useState<PanelFocus>("list");
   const [mouseCaptureEnabled, setMouseCaptureEnabled] = useState(true);
   const [activeIndex, setActiveIndex] = useState(0);
   const [detailOffset, setDetailOffset] = useState(0);
+  const [composerMode, setComposerMode] = useState<ComposerMode>(null);
+  const [composerBody, setComposerBody] = useState("");
+  const [composerError, setComposerError] = useState<string | null>(null);
+  const [isSubmittingComment, setIsSubmittingComment] = useState(false);
+  const panelFocusRef = useRef<PanelFocus>("list");
+  const pendingComposerRef = useRef<ComposerMode>(null);
+  const submitComposerRef = useRef<() => Promise<void>>(async () => undefined);
   const commitBaseUrl = `https://github.com/${data.repo.nameWithOwner}`;
 
-  const maxIndex = Math.max(0, rows.length - 1);
+  const maxIndex = Math.max(0, listRows.length - 1);
   const safeActiveIndex = clamp(activeIndex, 0, maxIndex);
-  const selectedRow = rows[safeActiveIndex];
+  const activeListRow = listRows[safeActiveIndex] || ADD_COMMENT_ROW;
+  const selectedRow = activeListRow.kind === "add-comment" ? null : activeListRow;
+
+  const openTopLevelComposer = useCallback((): void => {
+    const nextComposer: ComposerMode = { mode: "top-level" };
+    pendingComposerRef.current = nextComposer;
+    setComposerMode(nextComposer);
+    setComposerBody("");
+    setComposerError(null);
+    setDetailOffset(0);
+    panelFocusRef.current = "detail";
+    setPanelFocus("detail");
+  }, []);
+
+  const openReplyComposer = useCallback((row: UnifiedCommentRow): void => {
+    const nextComposer: ComposerMode = {
+      mode: "reply",
+      target: {
+        kind: row.kind,
+        id: row.commentId,
+        author: row.author,
+        htmlUrl: row.htmlUrl,
+        location: row.location
+      }
+    };
+    pendingComposerRef.current = nextComposer;
+    setComposerMode(nextComposer);
+    setComposerBody("");
+    setComposerError(null);
+    setDetailOffset(0);
+    panelFocusRef.current = "detail";
+    setPanelFocus("detail");
+  }, []);
+
+  const closeComposer = useCallback((): void => {
+    if (isSubmittingComment) {
+      return;
+    }
+
+    setComposerMode(null);
+    pendingComposerRef.current = null;
+    setComposerBody("");
+    setComposerError(null);
+    setDetailOffset(0);
+    panelFocusRef.current = "list";
+    setPanelFocus("list");
+  }, [isSubmittingComment]);
+
+  const submitComposer = useCallback(async (): Promise<void> => {
+    const activeComposer = composerMode ?? pendingComposerRef.current;
+    if (!activeComposer || isSubmittingComment) {
+      return;
+    }
+
+    const body = normalizeComposeNewlines(composerBody).trim();
+    if (!body) {
+      setComposerError("Comment body cannot be empty.");
+      return;
+    }
+
+    const request: SubmitCommentRequest =
+      activeComposer.mode === "top-level"
+        ? {
+            mode: "top-level",
+            body
+          }
+        : {
+            mode: "reply",
+            body,
+            target: {
+              kind: activeComposer.target.kind,
+              id: activeComposer.target.id,
+              author: activeComposer.target.author,
+              htmlUrl: activeComposer.target.htmlUrl
+            }
+          };
+
+    setIsSubmittingComment(true);
+    setComposerError(null);
+    try {
+      await onSubmitComment(request);
+      setComposerMode(null);
+      pendingComposerRef.current = null;
+      setComposerBody("");
+      setDetailOffset(0);
+      panelFocusRef.current = "list";
+      setPanelFocus("list");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setComposerError(`Failed to submit comment: ${message}`);
+    } finally {
+      setIsSubmittingComment(false);
+    }
+  }, [composerBody, composerMode, isSubmittingComment, onSubmitComment]);
+
+  useEffect(() => {
+    submitComposerRef.current = submitComposer;
+  }, [submitComposer]);
+
+  const startReplyForSelection = useCallback((): void => {
+    if (!selectedRow) {
+      return;
+    }
+
+    openReplyComposer(selectedRow);
+  }, [openReplyComposer, selectedRow]);
 
   useEffect(() => {
     setActiveIndex((prev) => clamp(prev, 0, maxIndex));
@@ -1058,7 +1371,26 @@ export function CommentsViewer({
 
   useEffect(() => {
     setDetailOffset(0);
-  }, [safeActiveIndex, selectedRow?.key]);
+  }, [
+    safeActiveIndex,
+    activeListRow.key,
+    composerMode?.mode,
+    composerMode && composerMode.mode === "reply" ? composerMode.target.id : 0
+  ]);
+
+  useEffect(() => {
+    panelFocusRef.current = panelFocus;
+  }, [panelFocus]);
+
+  useEffect(() => {
+    if (composerMode || panelFocus !== "detail") {
+      return;
+    }
+
+    if (activeListRow.kind === "add-comment") {
+      openTopLevelComposer();
+    }
+  }, [activeListRow.kind, composerMode, openTopLevelComposer, panelFocus]);
 
   useEffect(() => {
     if (!isRawModeSupported) {
@@ -1077,11 +1409,16 @@ export function CommentsViewer({
   const titleText = `ghr  ${data.repo.nameWithOwner}  #${data.pr.number}  ${data.pr.title}`;
   const prText = `PR: ${data.pr.url}`;
   const inferenceText = `Inference: ${data.prInference}`;
-  const selectionText = `Open PRs: ${openPrCount} | mouse capture ${mouseCaptureEnabled ? "on" : "off"}`;
+  const mouseCaptureStatus = !mouseCaptureEnabled
+    ? "off"
+    : composerMode
+      ? "paused (compose)"
+      : "on";
+  const selectionText = `Open PRs: ${openPrCount} | mouse capture ${mouseCaptureStatus}`;
   const refreshStatusText = `Auto refresh: every ${refreshEvery} | last update ${fmtTimeOfDay(lastUpdatedAt)}${isRefreshing ? " | refreshing..." : ""}`;
   const refreshErrorText = refreshError ? `Last refresh failed: ${refreshError}` : "";
   const helpText = isRawModeSupported
-    ? "Keys: j/k move, Tab focus, b PR list, m mouse capture, q quit"
+    ? "Keys: j/k move, Enter compose, r reply, Tab focus, b PR list, m mouse capture, q quit"
     : "Non-interactive terminal detected: rendered once and exiting.";
   const topHeaderLines =
     countWrappedPlainLines(titleText, appWrapWidth) +
@@ -1100,30 +1437,117 @@ export function CommentsViewer({
   const detailPanelHeight = Math.max(6, panelRowsAvailable - listPanelHeight);
   const detailPanelInnerHeight = Math.max(1, detailPanelHeight - 2);
   const listContentBudget = Math.max(1, listPanelHeight - 3);
-  const listWindow = clamp(listContentBudget, 1, Math.max(1, rows.length));
+  const listWindow = clamp(listContentBudget, 1, Math.max(1, listRows.length));
   const listPageStep = Math.max(1, listWindow - 1);
   const listStart = clamp(
     safeActiveIndex - Math.floor(listWindow / 2),
     0,
-    Math.max(0, rows.length - listWindow)
+    Math.max(0, listRows.length - listWindow)
   );
 
+  type DetailActionId = "compose" | "reply" | "send" | "cancel";
+  interface DetailActionButton {
+    id: DetailActionId;
+    label: string;
+    color?: NonNullable<InlineSpan["color"]>;
+    dim?: boolean;
+  }
+  interface DetailActionLayout extends DetailActionButton {
+    startX: number;
+    endX: number;
+  }
+
+  const detailActionButtons: DetailActionButton[] = useMemo(() => {
+    if (composerMode) {
+      return [
+        {
+          id: "send",
+          label: isSubmittingComment ? "[Sending...]" : "[Send]",
+          color: isSubmittingComment ? "gray" : "green",
+          dim: isSubmittingComment
+        },
+        { id: "cancel", label: "[Cancel]", color: "yellow" }
+      ];
+    }
+
+    if (selectedRow) {
+      return [{ id: "reply", label: "[Reply]", color: "cyan" }];
+    }
+
+    return [{ id: "compose", label: "[Compose]", color: "cyan" }];
+  }, [composerMode, isSubmittingComment, selectedRow]);
+
+  const detailActionSpans = useMemo(() => {
+    const spans: InlineSpan[] = [];
+    detailActionButtons.forEach((button, idx) => {
+      if (idx > 0) {
+        spans.push({ text: " " });
+      }
+
+      spans.push({
+        text: button.label,
+        color: button.color,
+        bold: true,
+        dim: Boolean(button.dim)
+      });
+    });
+
+    if (composerMode) {
+      spans.push({ text: "  Ctrl+S send | Esc cancel", dim: true });
+    } else if (selectedRow) {
+      spans.push({ text: "  Press r to reply", dim: true });
+    } else {
+      spans.push({ text: "  Press Enter to add a new comment...", dim: true });
+    }
+
+    return spans;
+  }, [composerMode, detailActionButtons, selectedRow]);
+
+  const detailActionColumnStart = 4;
+  const detailActionLayouts = useMemo<DetailActionLayout[]>(() => {
+    let cursor = detailActionColumnStart;
+    return detailActionButtons.map((button) => {
+      const startX = cursor;
+      const endX = cursor + button.label.length - 1;
+      cursor = endX + 2;
+      return {
+        ...button,
+        startX,
+        endX
+      };
+    });
+  }, [detailActionButtons]);
+
   const visibleRows = useMemo(() => {
-    return rows.slice(listStart, listStart + listWindow).map((row, idx) => {
+    return listRows.slice(listStart, listStart + listWindow).map((row, idx) => {
       const absolute = listStart + idx;
       const selected = absolute === safeActiveIndex;
+      if (row.kind === "add-comment") {
+        return {
+          row,
+          selected,
+          spans: [
+            { text: selected ? "> " : "  ", color: selected ? "yellow" : "gray" },
+            { text: row.label, color: "gray", dim: true }
+          ] as InlineSpan[]
+        };
+      }
+
       const when = fmtRelativeOrAbsolute(row.createdAt);
-      const spans = formatCommentListLine({
+      return {
+        row,
         selected,
-        depth: row.depth,
-        authorName: row.author,
-        preview: row.subline,
-        when,
-        width: listWrapWidth
-      });
-      return { row, selected, spans };
+        spans: formatCommentListLine({
+          selected,
+          depth: row.depth,
+          authorName: row.author,
+          preview: row.subline,
+          when,
+          width: listWrapWidth
+        })
+      };
     });
-  }, [rows, listStart, listWindow, safeActiveIndex, listWrapWidth]);
+  }, [listRows, listStart, listWindow, safeActiveIndex, listWrapWidth]);
 
   let layoutCursor = 0;
   layoutCursor += topHeaderLines;
@@ -1131,27 +1555,95 @@ export function CommentsViewer({
   const listPanelTopRow = layoutCursor + 1;
   layoutCursor += listPanelHeight;
   const detailPanelTopRow = layoutCursor + 1;
+  const listPanelBottomRow = listPanelTopRow + listPanelHeight - 1;
+  const detailPanelBottomRow = detailPanelTopRow + detailPanelHeight - 1;
+  const listFirstItemRow = listPanelTopRow + 2;
+  const detailActionRow = detailPanelBottomRow - 1;
 
-  const detailTitle = selectedRow
-    ? `${selectedRow.kind === "discussion" ? "Discussion" : "Inline"}  ${selectedRow.author}  ${fmtRelativeOrAbsolute(selectedRow.createdAt)}`
-    : "";
-  const detailLocation = selectedRow ? `Location: ${selectedRow.location}` : "";
-  const detailUrl = selectedRow?.htmlUrl || "";
-  let detailLinesAboveBody = 1;
-  if (!selectedRow) {
-    detailLinesAboveBody += 1;
+  const runDetailAction = useCallback((action: DetailActionId): void => {
+    if (action === "compose") {
+      openTopLevelComposer();
+      return;
+    }
+
+    if (action === "reply") {
+      startReplyForSelection();
+      return;
+    }
+
+    if (action === "cancel") {
+      closeComposer();
+      return;
+    }
+
+    if (action === "send") {
+      void submitComposerRef.current();
+    }
+  }, [closeComposer, openTopLevelComposer, startReplyForSelection]);
+
+  let detailTitle = "";
+  let detailLocation = "";
+  let detailUrl = "";
+  let detailBodyText = "";
+  if (composerMode) {
+    detailTitle =
+      composerMode.mode === "top-level"
+        ? "Write a top-level PR comment"
+        : `Reply to ${composerMode.target.author}`;
+    detailLocation =
+      composerMode.mode === "top-level"
+        ? "Target: PR discussion"
+        : `Target: ${normalizeSingleLineLabel(composerMode.target.location)}`;
+    detailUrl = "";
+    const normalizedComposerBody = normalizeComposeNewlines(composerBody);
+    detailBodyText = normalizedComposerBody.length > 0 ? `${normalizedComposerBody}|` : "|";
+  } else if (selectedRow) {
+    detailTitle = `${
+      selectedRow.kind === "discussion"
+        ? "Discussion"
+        : selectedRow.kind === "inline"
+          ? "Inline"
+          : "Review"
+    }  ${selectedRow.author}  ${fmtRelativeOrAbsolute(selectedRow.createdAt)}`;
+    detailLocation = `Location: ${normalizeSingleLineLabel(selectedRow.location)}`;
+    detailUrl = selectedRow.htmlUrl;
+    detailBodyText = selectedRow.body;
   } else {
-    detailLinesAboveBody += countWrappedPlainLines(detailTitle, detailWrapWidth);
-    detailLinesAboveBody += countWrappedPlainLines(detailLocation, detailWrapWidth);
+    detailTitle = "New top-level comment";
+    detailLocation = "Select \"Press Enter to add a new comment...\" and press Enter to open the editor.";
+    detailUrl = data.pr.url;
+    detailBodyText = "Type your comment in the editor shown in this panel.";
+  }
+  const detailRenderOptions = composerMode ? undefined : { commitBaseUrl };
+  const showPlaceholderBody = !composerMode && !selectedRow;
+  const showPlainBody = showPlaceholderBody || Boolean(composerMode);
+  // Detail panel interior contains:
+  // 1) "Details" header row
+  // 2) content block (title/location/url/error/body)
+  // 3) action row
+  // Reserve rows for header + action so body line budgeting matches visible space.
+  const detailNonActionLines = Math.max(1, detailPanelInnerHeight - 2);
+  let detailLinesAboveBody = 0;
+  detailLinesAboveBody += countWrappedPlainLines(detailTitle, detailWrapWidth);
+  detailLinesAboveBody += countWrappedPlainLines(detailLocation, detailWrapWidth);
+  if (detailUrl) {
     detailLinesAboveBody += countWrappedPlainLines(detailUrl, detailWrapWidth);
   }
-  const detailBodyLines = Math.max(1, detailPanelInnerHeight - detailLinesAboveBody);
+  if (composerError) {
+    detailLinesAboveBody += countWrappedPlainLines(composerError, detailWrapWidth);
+  }
+
+  const detailBodyLines = Math.max(1, detailNonActionLines - detailLinesAboveBody);
   const detailPageStep = Math.max(1, detailBodyLines - 1);
-  const detailBodyText = selectedRow?.body || "(no body)";
   const detailLineCount = useMemo(() => {
-    return countWrappedMarkdownLines(detailBodyText, 0, detailWrapWidth, { commitBaseUrl });
-  }, [commitBaseUrl, detailBodyText, detailWrapWidth]);
+    if (showPlainBody) {
+      return countWrappedPlainLines(detailBodyText, detailWrapWidth);
+    }
+
+    return countWrappedMarkdownLines(detailBodyText, 0, detailWrapWidth, detailRenderOptions);
+  }, [detailBodyText, detailRenderOptions, detailWrapWidth, showPlainBody]);
   const maxDetailOffset = Math.max(0, detailLineCount - detailBodyLines);
+  const detailStartLine = composerMode ? maxDetailOffset : detailOffset;
 
   useEffect(() => {
     setDetailOffset((prev) => clamp(prev, 0, maxDetailOffset));
@@ -1165,22 +1657,8 @@ export function CommentsViewer({
     setDetailOffset((prev) => clamp(prev + delta, 0, maxDetailOffset));
   }, [maxDetailOffset]);
 
-  const panelFocusRef = useRef(panelFocus);
-  const listPanelTopRowRef = useRef(listPanelTopRow);
-  const detailPanelTopRowRef = useRef(detailPanelTopRow);
-  const moveIndexRef = useRef(moveIndex);
-  const moveDetailRef = useRef(moveDetail);
-
   useEffect(() => {
-    panelFocusRef.current = panelFocus;
-    listPanelTopRowRef.current = listPanelTopRow;
-    detailPanelTopRowRef.current = detailPanelTopRow;
-    moveIndexRef.current = moveIndex;
-    moveDetailRef.current = moveDetail;
-  }, [panelFocus, listPanelTopRow, detailPanelTopRow, moveIndex, moveDetail]);
-
-  useEffect(() => {
-    if (!isRawModeSupported || !stdin.isTTY || !stdout.isTTY || !mouseCaptureEnabled) {
+    if (!isRawModeSupported || !stdin.isTTY || !stdout.isTTY || !mouseCaptureEnabled || Boolean(composerMode)) {
       return;
     }
 
@@ -1196,10 +1674,10 @@ export function CommentsViewer({
       }
 
       const panelAtMouseRow = (row: number): PanelFocus | null => {
-        if (row >= detailPanelTopRowRef.current) {
+        if (row >= detailPanelTopRow && row <= detailPanelBottomRow) {
           return "detail";
         }
-        if (row >= listPanelTopRowRef.current) {
+        if (row >= listPanelTopRow && row <= listPanelBottomRow) {
           return "list";
         }
         return null;
@@ -1210,19 +1688,44 @@ export function CommentsViewer({
 
         if (event.code === 64 || event.code === 65) {
           const delta = event.code === 64 ? -1 : 1;
+          panelFocusRef.current = targetPanel;
           setPanelFocus((prev) => (prev === targetPanel ? prev : targetPanel));
           if (targetPanel === "list") {
-            moveIndexRef.current(delta);
-          } else {
-            moveDetailRef.current(delta);
+            moveIndex(delta);
+          } else if (!composerMode) {
+            moveDetail(delta);
           }
           continue;
         }
 
         if (event.kind === "M" && event.code === 0) {
           const clickedPanel = panelAtMouseRow(event.y);
-          if (clickedPanel) {
-            setPanelFocus((prev) => (prev === clickedPanel ? prev : clickedPanel));
+          if (clickedPanel === "list") {
+            panelFocusRef.current = "list";
+            setPanelFocus("list");
+            const offset = event.y - listFirstItemRow;
+            if (offset >= 0 && offset < visibleRows.length) {
+              const next = clamp(listStart + offset, 0, maxIndex);
+              setActiveIndex(next);
+            }
+            continue;
+          }
+
+          if (clickedPanel === "detail") {
+            panelFocusRef.current = "detail";
+            setPanelFocus("detail");
+            if (!composerMode && activeListRow.kind === "add-comment") {
+              openTopLevelComposer();
+              continue;
+            }
+            if (Math.abs(event.y - detailActionRow) <= 1) {
+              const action = detailActionLayouts.find(
+                (button) => event.x >= button.startX && event.x <= button.endX
+              );
+              if (action) {
+                runDetailAction(action.id);
+              }
+            }
           }
         }
       }
@@ -1233,10 +1736,98 @@ export function CommentsViewer({
       stdin.off("data", onData);
       stdout.write(disableMouse);
     };
-  }, [isRawModeSupported, stdin, stdout, mouseCaptureEnabled]);
+  }, [
+    composerMode,
+    activeListRow.kind,
+    detailActionLayouts,
+    detailActionRow,
+    detailPanelBottomRow,
+    detailPanelTopRow,
+    isRawModeSupported,
+    listFirstItemRow,
+    listPanelBottomRow,
+    listPanelTopRow,
+    listStart,
+    maxIndex,
+    mouseCaptureEnabled,
+    moveDetail,
+    moveIndex,
+    openTopLevelComposer,
+    runDetailAction,
+    stdin,
+    stdout,
+    visibleRows.length
+  ]);
 
   useInput(
     (input, key) => {
+      const effectiveComposer = composerMode ?? pendingComposerRef.current;
+      if (effectiveComposer) {
+        const sanitizedInput = sanitizeComposeInput(input);
+
+        if (key.ctrl && input === "c") {
+          onExitRequest();
+          return;
+        }
+
+        if (key.ctrl && input.toLowerCase() === "s") {
+          void submitComposer();
+          return;
+        }
+
+        if (key.escape) {
+          closeComposer();
+          return;
+        }
+
+        if (key.return) {
+          if (!isSubmittingComment) {
+            const textWithoutNewlines = sanitizedInput.replace(/\n/g, "");
+            const newlineCount = Math.max(1, (sanitizedInput.match(/\n/g) || []).length);
+            setComposerBody((prev) =>
+              `${normalizeComposeNewlines(prev)}${textWithoutNewlines}${"\n".repeat(newlineCount)}`
+            );
+          }
+          return;
+        }
+
+        if (sanitizedInput.includes("\n")) {
+          if (!isSubmittingComment) {
+            setComposerBody((prev) => `${normalizeComposeNewlines(prev)}${sanitizedInput}`);
+          }
+          return;
+        }
+
+        if (key.tab || input === "\t") {
+          setPanelFocus((prev) => {
+            const next = prev === "list" ? "detail" : "list";
+            panelFocusRef.current = next;
+            return next;
+          });
+          return;
+        }
+
+        if (key.backspace || input === "\u007f" || key.delete) {
+          if (!isSubmittingComment) {
+            setComposerBody((prev) => prev.slice(0, -1));
+          }
+          return;
+        }
+
+        if (!key.ctrl && !key.meta && input.length > 0 && !key.tab) {
+          if (sanitizedInput.length === 0) {
+            return;
+          }
+
+          if (!isSubmittingComment) {
+            setComposerBody((prev) => `${normalizeComposeNewlines(prev)}${sanitizedInput}`);
+          }
+          return;
+        }
+
+        return;
+      }
+
       if (input === "q" || key.escape || (key.ctrl && input === "c")) {
         onExitRequest();
         return;
@@ -1252,8 +1843,27 @@ export function CommentsViewer({
         return;
       }
 
+      if (input === "r" && selectedRow) {
+        startReplyForSelection();
+        return;
+      }
+
+      if (key.return && activeListRow.kind === "add-comment") {
+        openTopLevelComposer();
+        return;
+      }
+
       if (key.tab || input === "\t") {
-        setPanelFocus((prev) => (prev === "list" ? "detail" : "list"));
+        if (panelFocus === "list" && activeListRow.kind === "add-comment") {
+          openTopLevelComposer();
+          return;
+        }
+
+        setPanelFocus((prev) => {
+          const next = prev === "list" ? "detail" : "list";
+          panelFocusRef.current = next;
+          return next;
+        });
         return;
       }
 
@@ -1340,57 +1950,65 @@ export function CommentsViewer({
         <Text color={panelFocus === "list" ? "yellow" : "cyan"} wrap="wrap">
           {`Comments (${rows.length})${panelFocus === "list" ? "  [focus]" : ""}`}
         </Text>
-        {rows.length === 0 ? (
-          <Text dimColor wrap="wrap">
-            No comments found.
+        {visibleRows.map((item) => (
+          <Text key={`comment-row-${item.row.key}`} wrap="truncate-end">
+            {""}
+            <InlineText spans={item.spans} />
           </Text>
-        ) : (
-          visibleRows.map((item) => (
-            <Text
-              key={`comment-row-${item.row.key}`}
-              wrap="truncate-end"
-            >
-              {""}
-              <InlineText spans={item.spans} />
-            </Text>
-          ))
-        )}
+        ))}
       </Box>
 
       <Box flexDirection="column" borderStyle="round" paddingX={1} height={detailPanelHeight}>
         <Text color={panelFocus === "detail" ? "yellow" : "magenta"} wrap="wrap">
           {`Details${panelFocus === "detail" ? "  [focus]" : ""}`}
         </Text>
-        {!selectedRow && (
-          <Text dimColor wrap="wrap">
-            No detail to show.
+        <Box flexDirection="column">
+          <Text wrap="wrap">
+            {detailTitle}
           </Text>
-        )}
-        {selectedRow && (
-          <Box flexDirection="column">
-            <Text wrap="wrap">
-              {detailTitle}
-            </Text>
-            <Text dimColor wrap="wrap">
-              {detailLocation}
-            </Text>
+          <Text dimColor wrap="wrap">
+            {detailLocation}
+          </Text>
+          {detailUrl && (
             <Text dimColor wrap="wrap">
               {detailUrl}
             </Text>
-            <Body
+          )}
+          {composerError && (
+            <Text color="red" wrap="wrap">
+              {composerError}
+            </Text>
+          )}
+          {showPlainBody ? (
+            <PlainBody
               text={detailBodyText}
-              startLine={detailOffset}
+              startLine={detailStartLine}
               maxLines={detailBodyLines}
               wrapWidth={detailWrapWidth}
-              renderOptions={{ commitBaseUrl }}
+              dim={showPlaceholderBody}
+              leftPad={1}
             />
-          </Box>
-        )}
+          ) : (
+            <Body
+              text={detailBodyText}
+              startLine={detailStartLine}
+              maxLines={detailBodyLines}
+              wrapWidth={detailWrapWidth}
+              renderOptions={detailRenderOptions}
+            />
+          )}
+        </Box>
+        <Text wrap="truncate-end">
+          {""}
+          <InlineText spans={detailActionSpans} />
+        </Text>
       </Box>
 
       <Box marginTop={1}>
         <Text dimColor wrap="wrap">
-          {helpText}
+          {composerMode
+            ? "Compose mode: type text, Enter newline, Ctrl+S send, Esc cancel."
+            : helpText}
         </Text>
       </Box>
     </Box>
