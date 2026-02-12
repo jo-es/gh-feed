@@ -1770,8 +1770,8 @@ export function CommentsViewer({
   const detailPanelTopRow = layoutCursor + 1;
   const listPanelBottomRow = listPanelTopRow + listPanelHeight - 1;
   const detailPanelBottomRow = detailPanelTopRow + detailPanelHeight - 1;
-  const listHeaderRow = listPanelTopRow + 1;
-  const listFirstItemRow = listPanelTopRow + 2;
+  const listHeaderRow = listPanelTopRow + 2;
+  const listFirstItemRow = listPanelTopRow + 3;
   const detailActionRow = detailPanelBottomRow - 1;
 
   const runDetailAction = useCallback((action: DetailActionId): void => {
