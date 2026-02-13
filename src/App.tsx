@@ -190,6 +190,7 @@ function normalizeBodyForDisplay(input: string): string {
 
   let output = decodeHtmlEntities(input);
   output = output.replace(/\r\n/g, "\n");
+  output = output.replace(/\t/g, "    ");
   output = output.replace(/<br\s*\/?>/gi, "\n");
   output = output.replace(/<(div|section|article|header|footer|aside)[^>]*>/gi, "\n");
   output = output.replace(/<\/(div|section|article|header|footer|aside)>\s*/gi, "\n");
@@ -496,7 +497,6 @@ function parseInlineSpans(input: string, options: MarkdownRenderOptions = {}): I
       const linkMatch = value.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
       if (linkMatch) {
         spans.push({ text: linkMatch[1], color: "blue", underline: true });
-        spans.push({ text: ` (${linkMatch[2]})`, dim: true });
       } else {
         spans.push({ text: value });
       }
@@ -561,11 +561,13 @@ function markdownToLines(text: string, options: MarkdownRenderOptions = {}): Mar
       continue;
     }
 
-    const quote = sourceLine.match(/^\s*>\s?(.*)$/);
+    const quote = sourceLine.match(/^(\s*(?:>\s?)+)(.*)$/);
     if (quote) {
+      const rawPrefix = quote[1].replace(/\s+$/, "");
+      const prefix = rawPrefix.length > 0 ? `${rawPrefix} ` : "> ";
       output.push({
-        prefix: "> ",
-        spans: parseInlineSpans(quote[1], options),
+        prefix,
+        spans: parseInlineSpans(quote[2], options),
         dim: true
       });
       continue;
@@ -716,9 +718,9 @@ function wrapMarkdownLine(line: MarkdownLine, baseIndent: number, wrapWidth: num
   const firstPrefix = `${" ".repeat(baseIndent)}${line.prefix}`;
   const sourceSpans: InlineSpan[] = [{ text: firstPrefix }, ...line.spans];
   const lineLeading = countLeadingSpaces(`${line.prefix}${plainText}`);
-  const continuationBase = lineLeading > 0 ? lineLeading : line.prefix.length;
+  const continuationBase = line.prefix.length > 0 ? line.prefix.length : lineLeading;
   const continuationIndent = " ".repeat(Math.max(0, baseIndent + continuationBase));
-  const safeWidth = Math.max(24, wrapWidth);
+  const safeWidth = Math.max(8, wrapWidth);
   const continuationPrefix = continuationIndent.slice(0, Math.max(0, safeWidth - 1));
   const output: WrappedBodyLine[] = [];
   let current: WrappedBodyLine = { spans: [], color: line.color, dim: line.dim };
@@ -965,14 +967,14 @@ function Body({
 
   let clipped: WrappedBodyLine[];
   let hidden = 0;
-  let padLines = 0;
   if (typeof maxLines === "number") {
     const safeMax = Math.max(1, maxLines);
-    const hiddenCandidate = Math.max(0, wrapped.length - (safeStart + safeMax));
-    const contentLimit = hiddenCandidate > 0 ? Math.max(0, safeMax - 1) : safeMax;
-    clipped = wrapped.slice(safeStart, safeStart + contentLimit);
-    hidden = hiddenCandidate;
-    padLines = safeMax - clipped.length - (hidden > 0 ? 1 : 0);
+    clipped = wrapped.slice(safeStart, safeStart + safeMax);
+    const hiddenCandidate = Math.max(0, wrapped.length - (safeStart + clipped.length));
+    if (hiddenCandidate > 0 && safeMax > 1) {
+      clipped = wrapped.slice(safeStart, safeStart + safeMax - 1);
+      hidden = Math.max(0, wrapped.length - (safeStart + clipped.length));
+    }
   } else {
     clipped = wrapped.slice(safeStart);
     hidden = Math.max(0, wrapped.length - (safeStart + clipped.length));
@@ -980,27 +982,26 @@ function Body({
 
   return (
     <Box flexDirection="column">
-      {clipped.map((line, idx) => (
-        <Text
-          key={`body-${idx}`}
-          color={line.color}
-          dimColor={Boolean(line.dim)}
-          wrap="wrap"
-        >
-          {""}
-          <InlineText spans={line.spans} />
-        </Text>
-      ))}
+      {clipped.map((line, idx) => {
+        const hasVisibleText = line.spans.some((span) => span.text.length > 0);
+        const safeSpans = hasVisibleText ? line.spans : [{ text: " " }];
+        return (
+          <Text
+            key={`body-${idx}`}
+            color={line.color}
+            dimColor={Boolean(line.dim)}
+            wrap="truncate-end"
+          >
+            {""}
+            <InlineText spans={safeSpans} />
+          </Text>
+        );
+      })}
       {hidden > 0 && (
-        <Text dimColor wrap="wrap">
+        <Text dimColor wrap="truncate-end">
           {`${" ".repeat(indent)}... (${hidden} more line${hidden === 1 ? "" : "s"})`}
         </Text>
       )}
-      {Array.from({ length: Math.max(0, padLines) }).map((_, idx) => (
-        <Text key={`body-pad-${idx}`} wrap="wrap">
-          {" "}
-        </Text>
-      ))}
     </Box>
   );
 }
@@ -1028,17 +1029,14 @@ function PlainBody({
 
   let clipped: string[];
   let hidden = 0;
-  let padLines = 0;
   if (typeof maxLines === "number") {
     const safeMax = Math.max(1, maxLines);
-    const hiddenCandidate = Math.max(0, wrapped.length - (safeStart + safeMax));
-    // Always render at least one content row. If we only have one row budget,
-    // skip the "... more lines" indicator instead of hiding all content.
-    const showHiddenIndicator = hiddenCandidate > 0 && safeMax > 1;
-    const contentLimit = showHiddenIndicator ? safeMax - 1 : safeMax;
-    clipped = wrapped.slice(safeStart, safeStart + contentLimit);
-    hidden = showHiddenIndicator ? hiddenCandidate : 0;
-    padLines = safeMax - clipped.length - (hidden > 0 ? 1 : 0);
+    clipped = wrapped.slice(safeStart, safeStart + safeMax);
+    const hiddenCandidate = Math.max(0, wrapped.length - (safeStart + clipped.length));
+    if (hiddenCandidate > 0 && safeMax > 1) {
+      clipped = wrapped.slice(safeStart, safeStart + safeMax - 1);
+      hidden = Math.max(0, wrapped.length - (safeStart + clipped.length));
+    }
   } else {
     clipped = wrapped.slice(safeStart);
     hidden = Math.max(0, wrapped.length - (safeStart + clipped.length));
@@ -1062,11 +1060,6 @@ function PlainBody({
             .padEnd(wrapWidth, " ")}
         </Text>
       )}
-      {Array.from({ length: Math.max(0, padLines) }).map((_, idx) => (
-        <Text key={`plain-body-pad-${idx}`} wrap="truncate-end">
-          {" ".repeat(Math.max(1, wrapWidth))}
-        </Text>
-      ))}
     </Box>
   );
 }
@@ -1307,7 +1300,7 @@ export function PrSelector({
   onSelect: (prNumber: number) => void;
   onExitRequest: () => void;
 }): JSX.Element {
-  const { isRawModeSupported } = useStdin();
+  const { isRawModeSupported, stdin } = useStdin();
   const { stdout } = useStdout();
 
   const initialIndex = useMemo(() => {
@@ -1343,7 +1336,7 @@ export function PrSelector({
     ? `${autoRefreshIntervalMs / 1000}s`
     : `${(autoRefreshIntervalMs / 1000).toFixed(1)}s`;
   const helpText = isRawModeSupported
-    ? `Keys: up/down or j/k move, Enter open PR, r refresh list, q quit | auto refresh ${refreshEvery}`
+    ? `Keys: up/down or j/k move, Right/Enter open PR, r refresh list, q quit | mouse: wheel scroll, click select/open | auto refresh ${refreshEvery}`
     : "Non-interactive terminal detected: rendered once and exiting.";
   const topHeaderLines =
     countWrappedPlainLines(titleText, appWrapWidth) +
@@ -1368,17 +1361,23 @@ export function PrSelector({
     return prs.slice(listStart, listStart + listWindow).map((pr, idx) => {
       const absolute = listStart + idx;
       const selected = absolute === safeIndex;
+      const headlinePrefix = `${selected ? ">" : " "} [${absolute + 1}] #${pr.number} `;
+      const headlineText = pr.title;
+      const sublinePrefix = "    ";
+      const sublineText = `${pr.headRefName} -> ${pr.baseRefName}  updated ${fmtRelativeOrAbsolute(pr.updatedAt)}`;
       const row: SelectorRow = {
         key: `selector-${pr.number}`,
-        headline: `${selected ? ">" : " "} [${absolute + 1}] #${pr.number} ${pr.title}`,
-        subline: `    ${pr.headRefName} -> ${pr.baseRefName}  updated ${fmtRelativeOrAbsolute(pr.updatedAt)}`
+        headline: `${headlinePrefix}${headlineText}`,
+        subline: `${sublinePrefix}${sublineText}`
       };
 
       return {
         row,
         selected,
-        headlineLines: wrapMarkdownLine({ prefix: "", spans: [{ text: row.headline }] }, 0, listWrapWidth),
-        sublineLines: wrapMarkdownLine({ prefix: "", spans: [{ text: row.subline }] }, 0, listWrapWidth)
+        absolute,
+        prNumber: pr.number,
+        headlineLines: wrapMarkdownLine({ prefix: headlinePrefix, spans: [{ text: headlineText }] }, 0, listWrapWidth),
+        sublineLines: wrapMarkdownLine({ prefix: sublinePrefix, spans: [{ text: sublineText }] }, 0, listWrapWidth)
       };
     });
   }, [prs, listStart, listWindow, safeIndex, listWrapWidth]);
@@ -1414,6 +1413,106 @@ export function PrSelector({
     return output;
   }, [prs.length, listContentBudget, visibleRows]);
 
+  const renderedRowHitRanges = useMemo(() => {
+    let cursor = 0;
+    return renderedRows.map((item) => {
+      const lineCount = Math.max(1, item.headlineLines.length + item.sublineLines.length);
+      const startOffset = cursor;
+      const endOffset = cursor + lineCount - 1;
+      cursor = endOffset + 1;
+      return {
+        startOffset,
+        endOffset,
+        absolute: item.absolute,
+        prNumber: item.prNumber
+      };
+    });
+  }, [renderedRows]);
+
+  let selectorLayoutCursor = 0;
+  selectorLayoutCursor += topHeaderLines;
+  selectorLayoutCursor += 1; // list marginTop
+  const listPanelTopRow = selectorLayoutCursor + 1;
+  const listPanelBottomRow = listPanelTopRow + listPanelHeight - 1;
+  const listHeaderRow = listPanelTopRow + 2;
+  const listFirstItemRow = listHeaderRow + 1;
+
+  useEffect(() => {
+    if (!isRawModeSupported || !stdin.isTTY || !stdout.isTTY) {
+      return;
+    }
+
+    const enableMouse = "\u001B[?1000h\u001B[?1006h";
+    const disableMouse = "\u001B[?1000l\u001B[?1006l";
+    stdout.write(enableMouse);
+
+    const onData = (chunk: Buffer | string): void => {
+      const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+      const events = parseMouseSequences(text);
+      if (events.length === 0) {
+        return;
+      }
+
+      for (const event of events) {
+        if (event.code === 64 || event.code === 65) {
+          const delta = event.code === 64 ? -1 : 1;
+          setActiveIndex((prev) => clamp(prev + delta, 0, maxIndex));
+          continue;
+        }
+
+        if (event.kind !== "M" || event.code !== 0) {
+          continue;
+        }
+
+        if (event.y < listPanelTopRow || event.y > listPanelBottomRow) {
+          continue;
+        }
+
+        if (event.y === listHeaderRow) {
+          continue;
+        }
+
+        const offset = event.y - listFirstItemRow;
+        if (offset < 0) {
+          continue;
+        }
+
+        const hit = renderedRowHitRanges.find(
+          (range) => offset >= range.startOffset && offset <= range.endOffset
+        );
+        if (!hit) {
+          continue;
+        }
+
+        if (safeIndex === hit.absolute && prs[hit.absolute]) {
+          onSelect(hit.prNumber);
+          continue;
+        }
+
+        setActiveIndex(hit.absolute);
+      }
+    };
+
+    stdin.on("data", onData);
+    return () => {
+      stdin.off("data", onData);
+      stdout.write(disableMouse);
+    };
+  }, [
+    isRawModeSupported,
+    listFirstItemRow,
+    listHeaderRow,
+    listPanelBottomRow,
+    listPanelTopRow,
+    maxIndex,
+    onSelect,
+    prs,
+    renderedRowHitRanges,
+    safeIndex,
+    stdin,
+    stdout
+  ]);
+
   useInput(
     (input, key) => {
       if (input === "q" || key.escape || (key.ctrl && input === "c")) {
@@ -1427,6 +1526,11 @@ export function PrSelector({
       }
 
       if (key.return && prs[safeIndex]) {
+        onSelect(prs[safeIndex].number);
+        return;
+      }
+
+      if (key.rightArrow && prs[safeIndex]) {
         onSelect(prs[safeIndex].number);
         return;
       }
@@ -1759,7 +1863,7 @@ export function CommentsViewer({
   const terminalRows = stdout.rows || 24;
   const terminalCols = stdout.columns || 80;
   const listWrapWidth = Math.max(24, terminalCols - 10);
-  const detailWrapWidth = Math.max(24, terminalCols - 8);
+  const detailWrapWidth = Math.max(8, terminalCols - 6);
   const appWrapWidth = Math.max(16, terminalCols - 2);
   const prTitleText = data.pr.title || "(untitled)";
   const headerRowOneText =
@@ -1804,7 +1908,7 @@ export function CommentsViewer({
       : "on";
   const refreshErrorText = refreshError ? `Last refresh failed: ${refreshError}` : "";
   const helpText = isRawModeSupported
-    ? `Keys: j/k move, Enter compose, r reply, c Copilot review, Tab focus, b PR list, m toggle mouse capture, q quit | mouse capture ${mouseCaptureStatus}`
+    ? `Keys: j/k move, Enter compose, r reply, c Copilot review, Tab focus, left-arrow/b PR list, m toggle mouse capture, q quit | mouse capture ${mouseCaptureStatus}`
     : "Non-interactive terminal detected: rendered once and exiting.";
   const topHeaderLines =
     countWrappedPlainLines(headerRowOneText, appWrapWidth) +
@@ -2069,23 +2173,22 @@ export function CommentsViewer({
     detailUrl = data.pr.url;
     detailBodyText = "Type your comment in the editor shown in this panel.";
   }
-  const detailRenderOptions = composerMode ? undefined : { commitBaseUrl };
+  const detailRenderOptions = !composerMode && selectedRow?.systemCommit ? { commitBaseUrl } : undefined;
   const showPlaceholderBody = !composerMode && !selectedRow;
   const showPlainBody = showPlaceholderBody || Boolean(composerMode);
   const activeDetailError = composerMode ? composerError : detailActionError;
   // Detail panel interior contains:
   // 1) "Details" header row
-  // 2) content block (title/location/url/error/body)
+  // 2) content block (title/url/error/body)
   // 3) action row
   // Reserve rows for header + action so body line budgeting matches visible space.
   const detailNonActionLines = Math.max(1, detailPanelInnerHeight - 2);
-  let detailLinesAboveBody = 0;
-  detailLinesAboveBody += countWrappedPlainLines(detailTitle, detailWrapWidth);
+  let detailLinesAboveBody = 1; // title
   if (detailUrl) {
-    detailLinesAboveBody += countWrappedPlainLines(detailUrl, detailWrapWidth);
+    detailLinesAboveBody += 1;
   }
   if (activeDetailError) {
-    detailLinesAboveBody += countWrappedPlainLines(activeDetailError, detailWrapWidth);
+    detailLinesAboveBody += 1;
   }
 
   const detailBodyLines = Math.max(1, detailNonActionLines - detailLinesAboveBody);
@@ -2319,6 +2422,11 @@ export function CommentsViewer({
         return;
       }
 
+      if (key.leftArrow) {
+        onBackToPrSelection();
+        return;
+      }
+
       if (input === "m") {
         setMouseCaptureEnabled((prev) => !prev);
         return;
@@ -2455,16 +2563,16 @@ export function CommentsViewer({
           {`Details${panelFocus === "detail" ? "  [focus]" : ""}`}
         </Text>
         <Box flexDirection="column" height={detailNonActionLines}>
-          <Text wrap="wrap">
+          <Text wrap="truncate-end">
             {detailTitle}
           </Text>
           {detailUrl && (
-            <Text dimColor wrap="wrap">
+            <Text dimColor wrap="truncate-end">
               {detailUrl}
             </Text>
           )}
           {activeDetailError && (
-            <Text color="red" wrap="wrap">
+            <Text color="red" wrap="truncate-end">
               {activeDetailError}
             </Text>
           )}
