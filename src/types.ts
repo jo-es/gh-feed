@@ -50,6 +50,15 @@ export interface PullRequestReview {
   user: UserRef | null;
 }
 
+export interface PrCommit {
+  sha: string;
+  htmlUrl: string;
+  message: string;
+  createdAt: string;
+  authorLogin: string | null;
+  authorName: string | null;
+}
+
 export type AiReviewEventAction = "requested" | "request_removed" | "submitted";
 
 export interface AiReviewEvent {
@@ -91,6 +100,13 @@ export interface CiStatusSummary {
   label: string;
 }
 
+export type MergeConflictState = "clean" | "conflicting" | "unknown";
+
+export interface MergeConflictSummary {
+  state: MergeConflictState;
+  label: string;
+}
+
 export interface RepoIdentity {
   owner: string;
   repo: string;
@@ -110,6 +126,8 @@ export interface LoadedPrComments {
   repo: RepoIdentity;
   pr: PrIdentity;
   ciStatus: CiStatusSummary;
+  mergeConflict: MergeConflictSummary;
+  commits: PrCommit[];
   issueComments: IssueComment[];
   reviewComments: ReviewComment[];
   inlineThreads: InlineThread[];

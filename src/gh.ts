@@ -8,6 +8,8 @@ import type {
   IssueComment,
   IssueResource,
   LoadedPrComments,
+  MergeConflictSummary,
+  PrCommit,
   PrIdentity,
   PrListItem,
   PullRequestReview,
@@ -57,6 +59,22 @@ interface RequestedReviewersResponse {
 
 interface PrCheckSummary {
   bucket?: string | null;
+}
+
+interface PullMergeabilityResponse {
+  mergeable?: boolean | null;
+  mergeable_state?: string | null;
+}
+
+interface RawPrCommit {
+  sha: string;
+  html_url: string;
+  author?: { login?: string | null } | null;
+  commit?: {
+    message?: string | null;
+    author?: { name?: string | null; date?: string | null } | null;
+    committer?: { date?: string | null } | null;
+  } | null;
 }
 
 async function run(
@@ -220,6 +238,48 @@ async function loadCiStatus(repo: RepoIdentity, prNumber: number): Promise<CiSta
   try {
     const checks = parseJson<PrCheckSummary[]>(output, `gh ${args.join(" ")}`);
     return summarizeCiStatus(checks);
+  } catch {
+    return {
+      state: "unknown",
+      label: "unknown"
+    };
+  }
+}
+
+function summarizeMergeConflictStatus(
+  payload: PullMergeabilityResponse
+): MergeConflictSummary {
+  const mergeableState = (payload.mergeable_state || "").trim().toLowerCase();
+  if (mergeableState === "dirty") {
+    return {
+      state: "conflicting",
+      label: "conflicts"
+    };
+  }
+
+  if ((mergeableState && mergeableState !== "unknown") || payload.mergeable === true) {
+    return {
+      state: "clean",
+      label: "no conflicts"
+    };
+  }
+
+  return {
+    state: "unknown",
+    label: "unknown"
+  };
+}
+
+async function loadMergeConflictStatus(
+  repo: RepoIdentity,
+  prNumber: number
+): Promise<MergeConflictSummary> {
+  try {
+    const response = await ghJson<PullMergeabilityResponse>([
+      "api",
+      `repos/${repo.owner}/${repo.repo}/pulls/${prNumber}`
+    ]);
+    return summarizeMergeConflictStatus(response);
   } catch {
     return {
       state: "unknown",
@@ -394,6 +454,23 @@ function normalizeReviews(input: PullRequestReview[]): PullRequestReview[] {
     const aTime = a.submitted_at ? new Date(a.submitted_at).getTime() : 0;
     const bTime = b.submitted_at ? new Date(b.submitted_at).getTime() : 0;
     return bTime - aTime;
+  });
+}
+
+function normalizePrCommits(input: RawPrCommit[]): PrCommit[] {
+  return [...input].map((commit) => {
+    const createdAt = commit.commit?.author?.date || commit.commit?.committer?.date || "";
+    const message = (commit.commit?.message || "").trim();
+    const authorLogin = commit.author?.login || null;
+    const authorName = commit.commit?.author?.name || null;
+    return {
+      sha: commit.sha,
+      htmlUrl: commit.html_url,
+      message: message || "(no message)",
+      createdAt,
+      authorLogin,
+      authorName
+    };
   });
 }
 
@@ -611,17 +688,21 @@ export async function loadPrComments(options: CliOptions): Promise<LoadedPrComme
   const [
     issueResource,
     issueCommentsRaw,
+    commitsRaw,
     reviewCommentsRaw,
     reviewsRaw,
     timelineEventsRaw,
-    ciStatus
+    ciStatus,
+    mergeConflict
   ] = await Promise.all([
     ghJson<IssueResource>(["api", `repos/${repo.owner}/${repo.repo}/issues/${pr.number}`]),
     ghPaginatedArray<IssueComment>(`repos/${repo.owner}/${repo.repo}/issues/${pr.number}/comments`),
+    ghPaginatedArray<RawPrCommit>(`repos/${repo.owner}/${repo.repo}/pulls/${pr.number}/commits`),
     ghPaginatedArray<ReviewComment>(`repos/${repo.owner}/${repo.repo}/pulls/${pr.number}/comments`),
     ghPaginatedArray<PullRequestReview>(`repos/${repo.owner}/${repo.repo}/pulls/${pr.number}/reviews`),
     loadTimelineEvents(repo, pr.number),
-    loadCiStatus(repo, pr.number)
+    loadCiStatus(repo, pr.number),
+    loadMergeConflictStatus(repo, pr.number)
   ]);
 
   const prDescription: IssueComment = {
@@ -639,6 +720,7 @@ export async function loadPrComments(options: CliOptions): Promise<LoadedPrComme
     ...issueCommentsRaw.map((comment) => ({ ...comment, is_pr_description: false }))
   ]);
   const reviewComments = normalizeReviewComments(reviewCommentsRaw);
+  const commits = normalizePrCommits(commitsRaw);
   const reviews = normalizeReviews(reviewsRaw);
   const inlineThreads = buildInlineThreads(reviewComments);
   const aiReviewEvents = buildAiReviewEvents({
@@ -650,6 +732,8 @@ export async function loadPrComments(options: CliOptions): Promise<LoadedPrComme
     repo,
     pr,
     ciStatus,
+    mergeConflict,
+    commits,
     issueComments,
     reviewComments,
     inlineThreads,

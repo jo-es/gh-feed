@@ -5,6 +5,7 @@ import type {
   InlineCommentNode,
   IssueComment,
   LoadedPrComments,
+  PrCommit,
   PullRequestReview,
   PrListItem,
   SubmitCommentRequest
@@ -58,6 +59,7 @@ interface UnifiedCommentRow {
   location: string;
   kind: ReplyableRowKind | "system";
   systemEvent?: AiReviewEvent;
+  systemCommit?: PrCommit;
 }
 
 type ReplyableUnifiedCommentRow = UnifiedCommentRow & { kind: ReplyableRowKind };
@@ -558,7 +560,8 @@ function sameInlineStyle(a: InlineSpan, b: InlineSpan): boolean {
     Boolean(a.italic) === Boolean(b.italic) &&
     Boolean(a.underline) === Boolean(b.underline) &&
     Boolean(a.dim) === Boolean(b.dim) &&
-    a.color === b.color
+    a.color === b.color &&
+    a.link === b.link
   );
 }
 
@@ -648,7 +651,8 @@ function wrapMarkdownLine(line: MarkdownLine, baseIndent: number, wrapWidth: num
       italic: span.italic,
       underline: span.underline,
       dim: span.dim,
-      color: span.color
+      color: span.color,
+      link: span.link
     };
 
     while (remaining.length > 0) {
@@ -782,9 +786,7 @@ function formatSystemEventListLine({
 
   const leftSpans: InlineSpan[] = [
     { text: selected ? "> " : "  ", color: selected ? "yellow" : "gray" },
-    { text: " ".repeat(Math.max(0, depth) * 2) },
-    { text: "system", color: SYSTEM_LABEL_COLOR, bold: true },
-    { text: " " }
+    { text: " ".repeat(Math.max(0, depth) * 2) }
   ];
 
   if (event.action === "requested") {
@@ -807,6 +809,39 @@ function formatSystemEventListLine({
     leftSpans.push({ text: ` submitted ${state} review`, dim: true });
   }
 
+  const trimmedLeft = trimStyledSpans(leftSpans, maxLeft);
+  const gap = Math.max(1, safeWidth - spanTextLength(trimmedLeft) - safeWhen.length);
+  return [
+    ...trimmedLeft,
+    { text: " ".repeat(gap) },
+    { text: safeWhen, color: "gray", dim: true }
+  ];
+}
+
+function formatSystemCommitListLine({
+  selected,
+  depth,
+  commit,
+  when,
+  width
+}: {
+  selected: boolean;
+  depth: number;
+  commit: PrCommit;
+  when: string;
+  width: number;
+}): InlineSpan[] {
+  const safeWidth = Math.max(8, width);
+  const safeWhen = truncateText(when, Math.max(2, safeWidth - 2));
+  const maxLeft = Math.max(1, safeWidth - safeWhen.length - 1);
+  const leftSpans: InlineSpan[] = [
+    { text: selected ? "> " : "  ", color: selected ? "yellow" : "gray" },
+    { text: " ".repeat(Math.max(0, depth) * 2) },
+    { text: "commit ", color: SYSTEM_LABEL_COLOR, bold: true },
+    { text: commitShaShort(commit.sha), color: "cyan", bold: true },
+    { text: " " },
+    { text: commitSubject(commit.message), dim: true }
+  ];
   const trimmedLeft = trimStyledSpans(leftSpans, maxLeft);
   const gap = Math.max(1, safeWidth - spanTextLength(trimmedLeft) - safeWhen.length);
   return [
@@ -1024,6 +1059,36 @@ function aiReviewEventBody(event: AiReviewEvent): string {
   return [summary, actor, state].filter(Boolean).join("\n");
 }
 
+function commitSubject(message: string): string {
+  const normalized = normalizeBodyForDisplay(message);
+  const [firstLine] = normalized.split("\n");
+  return normalizeSingleLineLabel(firstLine || "(no message)");
+}
+
+function commitShaShort(sha: string): string {
+  const normalized = (sha || "").trim();
+  return normalized ? normalized.slice(0, 7) : "unknown";
+}
+
+function commitSummary(commit: PrCommit): string {
+  return `commit ${commitShaShort(commit.sha)} ${commitSubject(commit.message)}`;
+}
+
+function commitBody(commit: PrCommit): string {
+  const lines: string[] = [
+    `Commit: ${commit.sha}`,
+    `Author: ${commit.authorLogin || commit.authorName || "unknown"}`
+  ];
+
+  if (commit.createdAt) {
+    lines.push(`Date: ${fmtDate(commit.createdAt)}`);
+  }
+
+  lines.push("");
+  lines.push(normalizeBodyForDisplay(commit.message));
+  return lines.join("\n");
+}
+
 function systemRow(event: AiReviewEvent): UnifiedCommentRow {
   const key = `system-${event.id}`;
   return {
@@ -1038,6 +1103,23 @@ function systemRow(event: AiReviewEvent): UnifiedCommentRow {
     location: "review workflow",
     kind: "system",
     systemEvent: event
+  };
+}
+
+function commitSystemRow(commit: PrCommit): UnifiedCommentRow {
+  const key = `system-commit-${commit.sha}`;
+  return {
+    key,
+    commentId: hashString(key),
+    depth: 0,
+    subline: commitSummary(commit),
+    body: commitBody(commit),
+    htmlUrl: commit.htmlUrl,
+    createdAt: commit.createdAt,
+    author: "system",
+    location: "commit",
+    kind: "system",
+    systemCommit: commit
   };
 }
 
@@ -1092,9 +1174,20 @@ function buildUnifiedRows(data: LoadedPrComments): UnifiedCommentRow[] {
   }
 
   for (const event of data.aiReviewEvents) {
+    if (event.action !== "requested") {
+      continue;
+    }
+
     grouped.push({
       sort: toTimestamp(event.createdAt),
       rows: [systemRow(event)]
+    });
+  }
+
+  for (const commit of data.commits) {
+    grouped.push({
+      sort: toTimestamp(commit.createdAt),
+      rows: [commitSystemRow(commit)]
     });
   }
 
@@ -1577,11 +1670,20 @@ export function CommentsViewer({
     }
   ];
   const ciDotColor: NonNullable<InlineSpan["color"]> = data.ciStatus.state === "pass" ? "green" : "red";
-  const ciStatusText = `CI: ● ${data.ciStatus.label}`;
-  const ciStatusSpans: InlineSpan[] = [
+  const mergeConflictDotColor: NonNullable<InlineSpan["color"]> = data.mergeConflict.state === "conflicting"
+    ? "red"
+    : data.mergeConflict.state === "clean"
+      ? "green"
+      : "yellow";
+  const statusIndicatorText = `CI: ● ${data.ciStatus.label} | Merge: ● ${data.mergeConflict.label}`;
+  const statusIndicatorSpans: InlineSpan[] = [
     { text: "CI: ", dim: true },
     { text: "●", color: ciDotColor, bold: true },
-    { text: ` ${data.ciStatus.label}`, dim: true }
+    { text: ` ${data.ciStatus.label}`, dim: true },
+    { text: " | ", dim: true },
+    { text: "Merge: ", dim: true },
+    { text: "●", color: mergeConflictDotColor, bold: true },
+    { text: ` ${data.mergeConflict.label}`, dim: true }
   ];
   const mouseCaptureStatus = !mouseCaptureEnabled
     ? "off"
@@ -1595,7 +1697,7 @@ export function CommentsViewer({
   const topHeaderLines =
     countWrappedPlainLines(headerRowOneText, appWrapWidth) +
     countWrappedPlainLines(prTitleText, appWrapWidth) +
-    countWrappedPlainLines(ciStatusText, appWrapWidth) +
+    countWrappedPlainLines(statusIndicatorText, appWrapWidth) +
     (refreshError ? countWrappedPlainLines(refreshErrorText, appWrapWidth) : 0);
   const helpLineCount = countWrappedPlainLines(helpText, appWrapWidth);
   const panelRowsAvailable = Math.max(9, terminalRows - (topHeaderLines + helpLineCount + 4));
@@ -1648,8 +1750,12 @@ export function CommentsViewer({
       return [{ id: "reply", label: "[Reply]", color: "cyan" }];
     }
 
+    if (selectedRow && selectedRow.kind === "system") {
+      return [];
+    }
+
     return [{ id: "compose", label: "[Compose]", color: "cyan" }];
-  }, [composerMode, isSubmittingComment, replyableSelectedRow]);
+  }, [composerMode, isSubmittingComment, replyableSelectedRow, selectedRow]);
 
   const detailActionSpans = useMemo(() => {
     const spans: InlineSpan[] = [];
@@ -1671,12 +1777,12 @@ export function CommentsViewer({
     } else if (isRequestingCopilot) {
       spans.push({ text: "  Requesting Copilot review...", dim: true });
     } else if (replyableSelectedRow) {
-      spans.push({ text: "  Press r to reply | c Copilot review (header button)", dim: true });
+      spans.push({ text: "  Press r to reply", dim: true });
     } else if (selectedRow && selectedRow.kind === "system") {
-      spans.push({ text: "  System event (read-only) | c Copilot review (header button)", dim: true });
+      spans.push({ text: "  System entry (read-only)", dim: true });
     } else {
       spans.push({
-        text: "  Press Enter to add a new comment... | c Copilot review (header button)",
+        text: "  Press Enter to add a new comment...",
         dim: true
       });
     }
@@ -1760,6 +1866,20 @@ export function CommentsViewer({
         };
       }
 
+      if (row.kind === "system" && row.systemCommit) {
+        return {
+          row,
+          selected,
+          spans: formatSystemCommitListLine({
+            selected,
+            depth: row.depth,
+            commit: row.systemCommit,
+            when,
+            width: listWrapWidth
+          })
+        };
+      }
+
       return {
         row,
         selected,
@@ -1809,7 +1929,6 @@ export function CommentsViewer({
   }, [closeComposer, openTopLevelComposer, startReplyForSelection]);
 
   let detailTitle = "";
-  let detailLocation = "";
   let detailUrl = "";
   let detailBodyText = "";
   if (composerMode) {
@@ -1817,10 +1936,6 @@ export function CommentsViewer({
       composerMode.mode === "top-level"
         ? "Write a top-level PR comment"
         : `Reply to ${composerMode.target.author}`;
-    detailLocation =
-      composerMode.mode === "top-level"
-        ? "Target: PR discussion"
-        : `Target: ${normalizeSingleLineLabel(composerMode.target.location)}`;
     detailUrl = "";
     const normalizedComposerBody = normalizeComposeNewlines(composerBody);
     detailBodyText = normalizedComposerBody.length > 0 ? `${normalizedComposerBody}|` : "|";
@@ -1830,16 +1945,14 @@ export function CommentsViewer({
         ? "Discussion"
         : selectedRow.kind === "inline"
           ? "Inline"
-          : selectedRow.kind === "review"
+        : selectedRow.kind === "review"
             ? "Review"
             : "System"
     }  ${selectedRow.author}  ${fmtRelativeOrAbsolute(selectedRow.createdAt)}`;
-    detailLocation = `Location: ${normalizeSingleLineLabel(selectedRow.location)}`;
-    detailUrl = selectedRow.htmlUrl;
+    detailUrl = selectedRow.systemCommit ? "" : selectedRow.htmlUrl;
     detailBodyText = selectedRow.body;
   } else {
     detailTitle = "New top-level comment";
-    detailLocation = "Select \"Press Enter to add a new comment...\" and press Enter to open the editor.";
     detailUrl = data.pr.url;
     detailBodyText = "Type your comment in the editor shown in this panel.";
   }
@@ -1855,7 +1968,6 @@ export function CommentsViewer({
   const detailNonActionLines = Math.max(1, detailPanelInnerHeight - 2);
   let detailLinesAboveBody = 0;
   detailLinesAboveBody += countWrappedPlainLines(detailTitle, detailWrapWidth);
-  detailLinesAboveBody += countWrappedPlainLines(detailLocation, detailWrapWidth);
   if (detailUrl) {
     detailLinesAboveBody += countWrappedPlainLines(detailUrl, detailWrapWidth);
   }
@@ -2202,7 +2314,7 @@ export function CommentsViewer({
       </Text>
       <Text wrap="wrap">
         {""}
-        <InlineText spans={ciStatusSpans} />
+        <InlineText spans={statusIndicatorSpans} />
       </Text>
       {refreshError && (
         <Text color="red" wrap="wrap">
@@ -2230,9 +2342,6 @@ export function CommentsViewer({
         <Box flexDirection="column" height={detailNonActionLines}>
           <Text wrap="wrap">
             {detailTitle}
-          </Text>
-          <Text dimColor wrap="wrap">
-            {detailLocation}
           </Text>
           {detailUrl && (
             <Text dimColor wrap="wrap">
